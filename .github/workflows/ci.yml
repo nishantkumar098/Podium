@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+    # `claude/**` covers the session branches this build is developed on, so
+    # every push gets a real CI signal without anyone remembering to trigger
+    # one by hand — the gap that let three latent ci.yml defects survive
+    # unnoticed until Phase H first ran this workflow for real.
+    branches: [main, "claude/**"]
+  pull_request:
+    branches: [main]
+  # Kept from Phase H: an on-demand run against any ref, for branches the
+  # push filter above doesn't cover.
+  workflow_dispatch: {}
+
+env:
+  DATABASE_URL: "postgresql://podium:podium_ci_password@localhost:5432/podium_ci_test?schema=public"
+  # Prisma DROPS AND RECREATES whatever it is given here. It must never be
+  # DATABASE_URL — see .env.example and docs/backup-and-restore.md.
+  SHADOW_DATABASE_URL: "postgresql://podium:podium_ci_password@localhost:5432/podium_ci_test_shadow?schema=public"
+  JWT_ACCESS_SECRET: "ci-only-access-secret-not-for-real-use"
+  JWT_REFRESH_SECRET: "ci-only-refresh-secret-not-for-real-use"
+  NODE_ENV: "test"
+
+jobs:
+  lint-typecheck-test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: podium
+          POSTGRES_PASSWORD: podium_ci_password
+          POSTGRES_DB: podium_ci_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U podium -d podium_ci_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Phase H.2 (self-correcting sub-phase): this used to also pin
+      # `version: 10` here, which pnpm/action-setup@v4 rejects outright when
+      # package.json *also* pins a packageManager field ("Multiple versions
+      # of pnpm specified") — a real, pre-existing config defect that had
+      # never actually run, since this workflow only ever triggered on
+      # main push/PR and this branch had never pushed there. Found the
+      # moment a real run was first triggered for Phase H. package.json's
+      # own "packageManager": "pnpm@10.33.0" is the single source of truth
+      # now; the action reads it automatically with no `version` input.
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build shared packages
+        run: |
+          pnpm --filter @podium/shared-types build
+          pnpm --filter @podium/db generate
+
+      - name: Run database migrations
+        run: pnpm --filter @podium/db exec prisma migrate deploy
+
+      # Phase H.2 (self-correcting sub-phase, continued): the seed script's
+      # own three-part guard (explicit env var + _dev/_ci/_test name suffix +
+      # row-count check — see packages/db/prisma/seed.ts's assertSafeToSeed,
+      # which must stay exactly this strict) refuses to run at all without
+      # PODIUM_ALLOW_DESTRUCTIVE_SEED=1. CI never set it, so this step had
+      # never actually succeeded — invisible until a real run was triggered.
+      # Scoped to just this step, not the whole job: it's the only place
+      # that needs it, and podium_ci_test is a fresh, disposable, correctly-
+      # named database each run, exactly the case the guard is designed to
+      # let through on explicit confirmation.
+      - name: Seed the CI database (dev fixture — never production data, see blueprint §37)
+        run: pnpm --filter @podium/db seed
+        env:
+          PODIUM_ALLOW_DESTRUCTIVE_SEED: "1"
+
+      - name: Typecheck
+        run: pnpm -r typecheck
+
+      - name: Lint
+        run: pnpm -r lint
+
+      - name: Build
+        run: |
+          pnpm --filter @podium/api build
+          pnpm --filter @podium/web build
+
+      - name: Create the Prisma shadow database
+        run: PGPASSWORD=podium_ci_password psql -h localhost -U podium -d postgres -c "CREATE DATABASE podium_ci_test_shadow OWNER podium;"
+
+      - name: Test — API (unit + e2e against the seeded CI database)
+        run: pnpm --filter @podium/api test
+
+  # Placeholder for when a deployment target is chosen (blueprint §35):
+  # deploy-web would target Vercel, deploy-api a container platform, both
+  # gated on lint-typecheck-test passing and, for anything touching
+  # money/inventory migrations, a manual approval environment.

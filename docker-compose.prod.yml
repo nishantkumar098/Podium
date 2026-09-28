@@ -1,0 +1,112 @@
+# Podium in production on one server (see docs/deploy-hostinger.md).
+#
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# caddy  :80/:443  HTTPS for $DOMAIN (certificate from Let's Encrypt, renewed
+#                  automatically); /api/* -> api, everything else -> web
+# web    Next.js (production build)
+# api    NestJS API; uploaded documents on the `storage` volume
+# workers  scheduled/background jobs (BullMQ on Redis)
+# redis  queue + schedule store for the workers
+# migrate  applies database migrations, then exits; api waits for it
+#
+# The database is external (Supabase) — DATABASE_URL in .env.production.
+
+name: podium
+
+x-app: &app
+  build:
+    context: .
+    args:
+      API_INTERNAL_URL: http://api:3001
+  image: podium-app:latest
+  env_file: .env.production
+  restart: unless-stopped
+
+x-runtime-env: &runtime-env
+  NODE_ENV: production
+  REDIS_URL: redis://redis:6379
+  STORAGE_DRIVER: local
+  STORAGE_LOCAL_PATH: /data/storage
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  migrate:
+    <<: *app
+    restart: "no"
+    command: ["pnpm", "--filter", "@podium/db", "migrate:deploy"]
+
+  api:
+    <<: *app
+    command: ["node", "apps/api/dist/main.js"]
+    environment:
+      <<: *runtime-env
+      API_PORT: "3001"
+      # Behind Caddy: read the visitor's real IP (rate limiting, audit).
+      TRUST_PROXY: "1"
+    volumes:
+      - storage:/data/storage
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3001/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  workers:
+    <<: *app
+    command: ["pnpm", "--filter", "@podium/workers", "start"]
+    environment:
+      <<: *runtime-env
+    volumes:
+      - storage:/data/storage
+    depends_on:
+      api:
+        condition: service_healthy
+
+  web:
+    <<: *app
+    command: ["pnpm", "--filter", "@podium/web", "start"]
+    environment:
+      NODE_ENV: production
+    depends_on:
+      api:
+        condition: service_healthy
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    env_file: .env.production
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+      - api
+
+volumes:
+  storage:
+  redis_data:
+  caddy_data:
+  caddy_config:

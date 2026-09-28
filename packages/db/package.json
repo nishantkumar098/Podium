@@ -1,0 +1,33 @@
+{
+  "name": "@podium/db",
+  "version": "0.1.0",
+  "private": true,
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "generate": "node scripts/with-root-env.cjs prisma generate",
+    "migrate": "node scripts/with-root-env.cjs prisma migrate dev",
+    "migrate:deploy": "node scripts/with-root-env.cjs prisma migrate deploy",
+    "seed": "node scripts/with-root-env.cjs ts-node --transpile-only prisma/seed.ts",
+    "studio": "node scripts/with-root-env.cjs prisma studio",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "echo \"(no lint configured for @podium/db yet)\"",
+    "test": "vitest run --passWithNoTests"
+  },
+  "prisma": {
+    "seed": "node scripts/with-root-env.cjs ts-node --transpile-only prisma/seed.ts"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.19.1",
+    "bcryptjs": "^2.4.3"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/node": "^20.16.10",
+    "prisma": "^5.19.1",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.5.4",
+    "vitest": "^2.0.5"
+  }
+}

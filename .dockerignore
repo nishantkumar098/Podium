@@ -1,0 +1,27 @@
+# Installed and built inside the image, never copied in.
+node_modules
+**/node_modules
+**/.next
+**/.next-prod
+**/dist
+**/*.tsbuildinfo
+.turbo
+
+# Secrets and local data stay off the image.
+.env
+.env.*
+!.env.example
+!.env.production.example
+.local-storage
+.local-verify
+backups
+dump.rdb
+
+# Not needed to run.
+.git
+.github
+.claude
+coverage
+playwright-report
+test-results
+*.log

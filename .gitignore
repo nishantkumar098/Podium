@@ -1,0 +1,64 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build artifacts
+dist/
+build/
+.next/
+.next-prod/
+out/
+*.tsbuildinfo
+
+# Environment
+.env
+.env.test
+.env.local
+.env.production
+.env.*.local
+!.env.example
+
+# Prisma
+packages/db/prisma/migrations/dev.db*
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Testing
+coverage/
+playwright-report/
+test-results/
+
+# IDE / OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local storage stub (dev file-storage backend)
+.local-storage/
+# screenshots written by scripts/verify-local-dev.mjs
+.local-verify/
+
+# Turbo / cache
+.turbo/
+backups/
+.run/
+
+# Playwright/browser verification scratch output
+verify-ui-tmp*.js
+dump.rdb
+
+# Deployment — archives made for uploading to the server, documents copied
+# off a machine, and server-only files. None of these belong in the repo.
+*.zip
+*.tgz
+*.tar.gz
+podium-docs/
+.env.production
+
+# Local tooling (Claude Code launch configs, editor state)
+.claude/

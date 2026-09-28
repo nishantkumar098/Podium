@@ -1,0 +1,22 @@
+# HTTPS for Podium. DOMAIN comes from .env.production; Caddy gets and renews
+# the Let's Encrypt certificate itself once DNS points at this server.
+{$DOMAIN} {
+	encode zstd gzip
+
+	# The API directly (same origin as the web app, so the sign-in cookies work).
+	handle /api/* {
+		reverse_proxy api:3001
+	}
+
+	# Everything else: the Next.js web app.
+	handle {
+		reverse_proxy web:3000
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+}

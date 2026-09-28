@@ -1,0 +1,24 @@
+{
+  "name": "@podium/workers",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "ts-node --transpile-only -P tsconfig.json src/main.ts",
+    "start": "ts-node --transpile-only -P tsconfig.json src/main.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@nestjs/core": "^10.4.4",
+    "@podium/api": "workspace:*",
+    "@podium/db": "workspace:*",
+    "bullmq": "^6.3.4",
+    "ioredis": "^6.0.0"
+  },
+  "devDependencies": {
+    "@types/multer": "^1.4.12",
+    "@types/node": "^20.19.43",
+    "dotenv": "^16.4.5",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.5.4"
+  }
+}

@@ -1,0 +1,2350 @@
+// Podium v2 — Prisma schema
+// Source of truth: docs/PODIUM-V2-PRODUCTION-BLUEPRINT.md §9, cross-checked
+// against docs/prototype/podium-v2-amm-brands.html.
+//
+// Conventions (blueprint §39 / prompt §6):
+//  - snake_case in the DB (via @map/@@map), camelCase in Prisma Client.
+//  - Every table has id/createdAt/updatedAt/createdById/updatedById/deletedAt.
+//    createdById/updatedById are plain UUID columns (not enforced FK relations)
+//    to avoid ~120 named self-relations to User across 60 tables — the
+//    authoritative attribution trail is `audit_logs`, written by a shared
+//    interceptor on every mutation (see apps/api/src/common/audit). This is a
+//    documented judgment call, logged in docs/STATUS.md.
+//  - `workspaceId` is carried on every root aggregate (never inferred) so
+//    every query can be scoped by tenant even with one tenant today (blueprint §30).
+//  - Soft delete via `deletedAt`; nothing is ever hard-deleted except
+//    ephemeral/session-like rows (idempotency_keys).
+//  - Money stored as Decimal(14,2) (INR, no currency column yet — single-currency
+//    business; flag before adding multi-currency).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+  
+  // A separate, disposable database Prisma drops and recreates when diffing
+  // migrations. Declaring it here means no migration command can ever be
+  // handed the real database by accident from the command line.
+  shadowDatabaseUrl = env("SHADOW_DATABASE_URL")
+}
+
+// =========================================================================
+// ENUMS
+// =========================================================================
+
+enum ClientType {
+  INDIVIDUAL
+  CORPORATE
+  BRAND
+}
+
+// Keeps the ~55k-row Cocktail Shop e-commerce dump from burying the real,
+// name-rich B2B event client list on the Clients screen. Every query that
+// powers the main Clients view filters on EVENT_CLIENT; retail customers are
+// reachable only by explicitly asking for that segment.
+enum ClientSegment {
+  EVENT_CLIENT
+  RETAIL_CUSTOMER
+}
+
+// Separates the live, human-worked sales pipeline (Elixir query sheets) from
+// the bulk cold-prospecting lists. Both live in `leads` because they share a
+// lifecycle — a cold prospect that answers becomes a pipeline lead — but the
+// CRM board must never default to showing ~9k cold rows alongside ~200 real
+// opportunities.
+enum LeadKind {
+  PIPELINE
+  COLD_PROSPECT
+}
+
+enum LeadStage {
+  LEAD
+  QUALIFIED
+  PROPOSAL
+  NEGOTIATION
+  WON
+  LOST // [REQUIRED] — absent from prototype's CRM_STAGES, needed for pipeline forecasting (blueprint §18)
+}
+
+enum VendorStatus {
+  PREFERRED
+  APPROVED
+  BLACKLISTED
+}
+
+enum ProjectStatus {
+  PLANNING
+  PLANNED
+  IN_PROGRESS
+  CLIENT_REVIEW
+  ON_HOLD
+  COMPLETED
+  CANCELLED
+}
+
+enum ProjectHealth {
+  GREEN
+  AMBER
+  RED
+}
+
+enum ProjectMemberRole {
+  PROJECT_MANAGER
+  TEAM_MEMBER
+  OBSERVER
+}
+
+enum TaskStatus {
+  BACKLOG
+  PLANNED
+  IN_PROGRESS
+  CLIENT_REVIEW
+  APPROVED
+  COMPLETED
+}
+
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum FlowInstanceStatus {
+  DRAFT
+  ACTIVE
+  COMPLETED
+  CANCELLED
+}
+
+enum FlowStepStatus {
+  LOCKED
+  READY
+  ACTIVE
+  COMPLETED
+  BLOCKED
+  ESCALATED
+  CANCELLED
+  FAILED
+}
+
+enum JoinType {
+  AND
+  OR
+}
+
+enum InventoryMovementType {
+  PURCHASE
+  RECEIVE
+  RESERVE
+  CONSUME
+  TRANSFER_OUT
+  TRANSFER_IN
+  DAMAGE
+  ADJUSTMENT
+  RETURN
+}
+
+enum ReservationStatus {
+  RESERVED
+  CONSUMED
+  RELEASED
+}
+
+enum PurchaseRequestStatus {
+  QUOTE_COMPARISON
+  RFQ_SENT
+  APPROVAL_PENDING
+  PO_RAISED
+  GOODS_RECEIVED
+  REJECTED
+}
+
+enum PurchaseOrderStatus {
+  DRAFT
+  SENT
+  PARTIALLY_RECEIVED
+  RECEIVED
+  // Terminal: no further receipts accepted. Distinct from RECEIVED, which
+  // means "every ordered line arrived" — a PO can be closed short.
+  CLOSED
+  CANCELLED
+}
+
+enum ExpenseStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  REIMBURSED
+}
+
+enum InvoiceStatus {
+  DRAFT
+  ISSUED
+  PARTIALLY_PAID
+  PAID
+  OVERDUE
+  CANCELLED
+}
+
+// AMM issues two documents off the same data. A TAX_INVOICE is the GST
+// document; an ESTIMATE is the pre-event quotation, which carries the same
+// figures but is explicitly not a demand for tax.
+enum InvoiceDocType {
+  TAX_INVOICE
+  ESTIMATE
+}
+
+// The supplied invoice splits line items into two headed sections. FIXED is
+// contracted scope at agreed rates; VARIABLE is billed on actuals after the
+// event. The distinction is printed on the document, so it belongs on the
+// row rather than being inferred at render time.
+enum InvoiceScope {
+  FIXED
+  VARIABLE
+}
+
+// How a catalogue product is priced — mirrors the Elixir export.
+enum ProductPricingMode {
+  PER_QUANTITY
+  PER_GUEST
+  FIXED
+}
+
+enum PaymentMethod {
+  CASH
+  BANK_TRANSFER
+  UPI
+  CHEQUE
+  CARD
+  OTHER
+}
+
+enum AdjustmentNoteType {
+  CREDIT
+  DEBIT
+}
+
+enum LicenceStatus {
+  NOT_APPLIED
+  APPLIED
+  APPROVED
+  REJECTED
+}
+
+enum RiskSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum RiskStatus {
+  OPEN
+  MITIGATING
+  MONITORING
+  CLOSED
+}
+
+enum ApprovalType {
+  CREATIVE
+  BUDGET
+  PURCHASE
+  CLIENT
+  VENDOR
+  PAYMENT
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum ChannelKind {
+  COMPANY
+  CITY
+  PROJECT
+  /// Private one-to-one conversation; its members are the only readers.
+  DM
+  /// Custom group anyone can create and add people to; members-only.
+  GROUP
+  /// One per department. Membership follows User.departmentId and is kept in
+  /// step automatically — nobody adds or removes people by hand.
+  DEPARTMENT
+}
+
+enum DocumentType {
+  CONTRACT
+  DESIGN
+  CREATIVE
+  PURCHASE_ORDER
+  GOVERNMENT_PERMIT
+  GUEST_LIST
+  OTHER
+}
+
+enum CityAccessScope {
+  READ
+  WRITE
+  ALL // explicit "all cities" grant — never the absence of a filter (blueprint §10)
+}
+
+enum LeaveType {
+  CASUAL
+  EARNED
+  SICK
+  OTHER
+}
+
+enum LeaveStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum AttendanceStatus {
+  PRESENT
+  ON_SITE
+  REMOTE
+  ON_LEAVE
+}
+
+enum AutomationRunStatus {
+  PENDING
+  SUCCESS
+  FAILED
+  RETRYING
+  /// The trigger fired and matched, but the action could not run because the
+  /// underlying record lacks fields a human must supply. Recorded as a real
+  /// run so the gap is visible and countable — never silently skipped, and
+  /// never worked around by inventing the missing data.
+  BLOCKED
+}
+
+enum IncidentSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+// =========================================================================
+// WORKSPACE / TENANT ROOT
+// =========================================================================
+
+model Workspace {
+  id        String    @id @default(uuid()) @db.Uuid
+  name      String
+  gstin     String?
+  /// Registered address, printed under the letterhead on every document.
+  address   String?
+  website   String?
+  /// Remittance details printed on invoices. These are AMM's OWN account for
+  /// receiving payment — they belong on the document by design, and are
+  /// deliberately configuration rather than constants in the renderer so
+  /// changing bank does not mean changing code. Note this is a different
+  /// thing entirely from the employee/third-party financial data that
+  /// scripts/forbidden-sheet.ts refuses to import.
+  bankName      String? @map("bank_name")
+  bankAccountName String? @map("bank_account_name")
+  bankAccountNo String? @map("bank_account_no")
+  bankIfsc      String? @map("bank_ifsc")
+  /// Numbered terms, in print order. AMM's own wording, supplied with the
+  /// invoice design — never generated, because inventing contract terms for
+  /// a real company is not something a renderer should do.
+  invoiceTerms  String[] @map("invoice_terms")
+  /// The declaration line above the authorised signature.
+  invoiceDeclaration String? @map("invoice_declaration")
+  /// Purchase requests at or above this value need an approval before a PO can
+  /// be raised. Configurable per workspace rather than hardcoded.
+  procurementApprovalThreshold Decimal @default(50000) @map("procurement_approval_threshold") @db.Decimal(14, 2)
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  cities            City[]
+  brands            Brand[]
+  products          Product[]
+  users             User[]
+  roles             Role[]
+  permissions       Permission[]
+  clients           Client[]
+  vendors           Vendor[]
+  leads             Lead[]
+  playbooks         Playbook[]
+  projects          Project[]
+  flowTemplates     FlowTemplate[]
+  inventoryItems    InventoryItem[]
+  recipes           Recipe[]
+  invoiceCounters   InvoiceCounter[]
+  licences          Licence[]
+  channels          Channel[]
+  sops              Sop[]
+  automationRules   AutomationRule[]
+  notifications     Notification[]
+  auditLogs         AuditLog[]
+  documents         Document[]
+  freelancers       Freelancer[]
+  invoices          Invoice[]
+  crewRequests      CrewRequest[]
+  departments       Department[]
+
+  @@map("workspaces")
+}
+
+// =========================================================================
+// CITIES / GST REFERENCE
+// =========================================================================
+
+model City {
+  id          String    @id @default(uuid()) @db.Uuid
+  workspaceId String    @map("workspace_id") @db.Uuid
+  name        String
+  code        String // e.g. JPR, UDR, DEL, BOM, BLR, GOA
+  state       String
+  gstStateCode String   @map("gst_state_code") // e.g. "08" Rajasthan — see GstStateCode for the full 36-code reference
+  isHq        Boolean   @default(false) @map("is_hq")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  createdById String?   @map("created_by") @db.Uuid
+  updatedById String?   @map("updated_by") @db.Uuid
+  deletedAt   DateTime? @map("deleted_at")
+
+  workspace            Workspace             @relation(fields: [workspaceId], references: [id])
+  clients              Client[]
+  vendors              Vendor[]
+  projects             Project[]
+  invoices             Invoice[]
+  licences             Licence[]
+  inventoryLocations   InventoryLocation[]
+  channels             Channel[]
+  userCityAccess       UserCityAccess[]
+  invoiceCounters      InvoiceCounter[]
+  leads                Lead[]
+  freelancers          Freelancer[]
+  usersPrimary         User[]                @relation("UserPrimaryCity")
+
+  @@unique([workspaceId, code])
+  @@map("cities")
+}
+
+/// Full GST state-code reference table (all 36 Indian states/UTs), so a new
+/// operating city is a data row, never a code change (blueprint §10).
+model GstStateCode {
+  code  String @id // e.g. "08"
+  state String @unique
+
+  @@map("gst_state_codes")
+}
+
+// =========================================================================
+// USERS / RBAC
+// =========================================================================
+
+model User {
+  id             String    @id @default(uuid()) @db.Uuid
+  workspaceId    String    @map("workspace_id") @db.Uuid
+  name           String
+  /// Sign-in identifier: the person's name, lower-cased, spaces as dots
+  /// ("shweta.singh"). Staff have no company mailboxes to log in with.
+  username       String?   @unique
+  email          String?   @unique
+  /// NULL until the person's first sign-in, when the password they type
+  /// becomes permanent. An Admin/Founder reset returns it to NULL.
+  passwordHash   String?   @map("password_hash")
+  // BUG-003 (2026-09-12 CTO audit): every account used to share one
+  // published password with no way to change it. mustChangePassword forces
+  // a real change before anything else works (see MustChangePasswordGuard);
+  // failedLoginAttempts/lockedUntil implement lockout in AuthService.login;
+  // passwordChangedAt is set on every successful change, invite acceptance,
+  // and login (so "when did this password last change" is a real answer).
+  mustChangePassword  Boolean   @default(false) @map("must_change_password")
+  failedLoginAttempts Int       @default(0) @map("failed_login_attempts")
+  lockedUntil         DateTime? @map("locked_until")
+  passwordChangedAt   DateTime? @map("password_changed_at")
+  googleSub      String?   @unique @map("google_sub")
+  /// Legacy free-text department, as AMM's HR sheet writes it. Kept for
+  /// display and for classifying rows nobody has assigned yet; departmentId
+  /// below is what authorization actually reads.
+  dept           String?
+  departmentId   String?   @map("department_id") @db.Uuid
+  primaryRoleId  String?   @map("primary_role_id") @db.Uuid
+  primaryCityId  String?   @map("primary_city_id") @db.Uuid
+  isExternal     Boolean   @default(false) @map("is_external") // true for CLIENT/VENDOR portal users
+  externalClientId String? @map("external_client_id") @db.Uuid
+  externalVendorId String? @map("external_vendor_id") @db.Uuid
+  isActive       Boolean   @default(true) @map("is_active")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+  createdById    String?   @map("created_by") @db.Uuid
+  updatedById    String?   @map("updated_by") @db.Uuid
+  deletedAt      DateTime? @map("deleted_at")
+
+  workspace          Workspace         @relation(fields: [workspaceId], references: [id])
+  primaryRole        Role?             @relation("UserPrimaryRole", fields: [primaryRoleId], references: [id])
+  department         Department?       @relation(fields: [departmentId], references: [id])
+  primaryCity        City?             @relation("UserPrimaryCity", fields: [primaryCityId], references: [id])
+  userRoles          UserRole[]
+  cityAccess         UserCityAccess[]
+  refreshTokens      RefreshToken[]
+  projectsAsPm       Project[]         @relation("ProjectPM")
+  projectMembers     ProjectMember[]
+  tasksOwned         Task[]            @relation("TaskOwner")
+  flowStepsOwned     FlowStep[]        @relation("FlowStepOwner")
+  expenses           Expense[]
+  expensesApproved   Expense[]         @relation("ExpenseApprover")
+  leavesRequested    Leave[]
+  attendance         Attendance?
+  notifications      Notification[]
+  messages           Message[]
+  channelMemberships ChannelMember[]
+  auditLogs          AuditLog[]
+  leadsOwned         Lead[]            @relation("LeadOwner")
+  googleAccount      GoogleAccount?
+  licencesOwned      Licence[]         @relation("LicenceOwner")
+  risksOwned         Risk[]            @relation("RiskOwner")
+  passwordInvites    PasswordInvite[]
+
+  @@map("users")
+}
+
+// BUG-003: a one-time, single-use token that lets a user set their own
+// password without AMM's shared password ever being involved — used both for
+// inviting a brand-new user and for resetting an existing one. Only the
+// SHA-256 hash of the raw token is ever stored (same pattern as
+// RefreshToken.tokenHash): the raw value exists only in the URL handed to
+// the user, never at rest.
+//
+// How that URL actually reaches the user (email, SMS, a manually shared
+// link) is intentionally NOT decided here — see docs/STATUS.md §1.3. This
+// table only needs to know that a token was issued, by whom, and whether
+// it's still usable.
+model PasswordInvite {
+  id          String    @id @default(uuid()) @db.Uuid
+  userId      String    @map("user_id") @db.Uuid
+  tokenHash   String    @unique @map("token_hash")
+  expiresAt   DateTime  @map("expires_at")
+  usedAt      DateTime? @map("used_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  createdById String?   @map("created_by") @db.Uuid
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@map("password_invites")
+}
+
+model Role {
+  id          String    @id @default(uuid()) @db.Uuid
+  workspaceId String    @map("workspace_id") @db.Uuid
+  name        String // Founder, Admin, Project Manager, Operations, Finance, Sales, Creative, Employee, Client, Vendor
+  description String?
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  deletedAt   DateTime? @map("deleted_at")
+
+  workspace       Workspace        @relation(fields: [workspaceId], references: [id])
+  usersPrimary    User[]           @relation("UserPrimaryRole")
+  userRoles       UserRole[]
+  rolePermissions RolePermission[]
+
+  @@unique([workspaceId, name])
+  @@map("roles")
+}
+
+model Permission {
+  id          String   @id @default(uuid()) @db.Uuid
+  workspaceId String   @map("workspace_id") @db.Uuid
+  resource    String // e.g. "projects", "invoices", "inventory_movements"
+  action      String // view | create | edit | delete | approve | export
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  workspace       Workspace        @relation(fields: [workspaceId], references: [id])
+  rolePermissions RolePermission[]
+
+  @@unique([workspaceId, resource, action])
+  @@map("permissions")
+}
+
+model RolePermission {
+  roleId       String @map("role_id") @db.Uuid
+  permissionId String @map("permission_id") @db.Uuid
+
+  role       Role       @relation(fields: [roleId], references: [id])
+  permission Permission @relation(fields: [permissionId], references: [id])
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+model UserRole {
+  userId String @map("user_id") @db.Uuid
+  roleId String @map("role_id") @db.Uuid
+
+  user User @relation(fields: [userId], references: [id])
+  role Role @relation(fields: [roleId], references: [id])
+
+  @@id([userId, roleId])
+  @@map("user_roles")
+}
+
+/// Which cities a user may act in. "All cities" is an explicit ALL-scope grant,
+/// never the absence of a row (blueprint §10). cityId is null exactly when
+/// scope = ALL.
+model UserCityAccess {
+  id        String          @id @default(uuid()) @db.Uuid
+  userId    String          @map("user_id") @db.Uuid
+  cityId    String?         @map("city_id") @db.Uuid
+  scope     CityAccessScope
+  createdAt DateTime        @default(now()) @map("created_at")
+
+  user User  @relation(fields: [userId], references: [id])
+  city City? @relation(fields: [cityId], references: [id])
+
+  @@unique([userId, cityId])
+  @@index([userId])
+  @@map("user_city_access")
+}
+
+/// A part of the business. Roles belong to a department (see
+/// apps/api/src/common/rbac/model.ts), people are assigned to one, and
+/// projects and tasks name the department that owns them plus the ones
+/// supporting them. Departments are rows rather than an enum precisely so a
+/// new one can be added without a migration or a code change.
+model Department {
+  id          String    @id @default(uuid()) @db.Uuid
+  workspaceId String    @map("workspace_id") @db.Uuid
+  /// Stable machine key, matching DEPARTMENTS in the RBAC model ("FINANCE").
+  key         String
+  name        String
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  deletedAt   DateTime? @map("deleted_at")
+
+  workspace        Workspace           @relation(fields: [workspaceId], references: [id])
+  users            User[]
+  channels         Channel[]
+  projectsPrimary  Project[]           @relation("ProjectPrimaryDepartment")
+  tasksPrimary     Task[]              @relation("TaskPrimaryDepartment")
+  projectSupport   ProjectDepartment[]
+  taskSupport      TaskDepartment[]
+
+  @@unique([workspaceId, key])
+  @@map("departments")
+}
+
+/// A department supporting a project it does not own — the cross-department
+/// dependency. It grants sight of the project, never of every section of it.
+model ProjectDepartment {
+  projectId    String   @map("project_id") @db.Uuid
+  departmentId String   @map("department_id") @db.Uuid
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  project    Project    @relation(fields: [projectId], references: [id])
+  department Department @relation(fields: [departmentId], references: [id])
+
+  @@id([projectId, departmentId])
+  @@map("project_departments")
+}
+
+/// A department supporting a task owned by another one. Same rule as
+/// ProjectDepartment: enough to do the work, and nothing more.
+model TaskDepartment {
+  taskId       String   @map("task_id") @db.Uuid
+  departmentId String   @map("department_id") @db.Uuid
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  task       Task       @relation(fields: [taskId], references: [id])
+  department Department @relation(fields: [departmentId], references: [id])
+
+  @@id([taskId, departmentId])
+  @@map("task_departments")
+}
+
+model RefreshToken {
+  id          String    @id @default(uuid()) @db.Uuid
+  userId      String    @map("user_id") @db.Uuid
+  tokenHash   String    @unique @map("token_hash")
+  expiresAt   DateTime  @map("expires_at")
+  revokedAt   DateTime? @map("revoked_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+// =========================================================================
+// CLIENTS / VENDORS / CRM
+// =========================================================================
+
+model Client {
+  id          String     @id @default(uuid()) @db.Uuid
+  workspaceId String     @map("workspace_id") @db.Uuid
+  name        String
+  type        ClientType
+  /// Nullable since the real AMM client list carries no city for most rows.
+  /// Guessing one would be worse than leaving it blank: city drives invoice
+  /// GST treatment and the city-scope predicate. An unassigned client is
+  /// visible only to ALL-scope users (a `cityId IN (...)` filter excludes
+  /// NULL), which is the safe default — it under-shares rather than leaks.
+  cityId      String?    @map("city_id") @db.Uuid
+  /// Canonical 10-digit form (see §2 normalization) — the dedupe key.
+  phone       String?
+  /// Original string as it appeared in the source, country code intact.
+  phoneRaw    String?    @map("phone_raw")
+  email       String?
+  address     String?
+  /// Provenance, e.g. "AMM Client Database import".
+  source      String?
+  segment     ClientSegment @default(EVENT_CLIENT) @map("client_segment")
+  /// `Customer ID` from the Cocktail Shop DATA DUMP, where one exists.
+  externalRef String?    @map("external_ref")
+  gstin       String?
+  gstStateCode String?   @map("gst_state_code")
+  ltv         Decimal    @default(0) @db.Decimal(14, 2)
+  since       DateTime?
+  createdAt   DateTime   @default(now()) @map("created_at")
+  updatedAt   DateTime   @updatedAt @map("updated_at")
+  createdById String?    @map("created_by") @db.Uuid
+  updatedById String?    @map("updated_by") @db.Uuid
+  deletedAt   DateTime?  @map("deleted_at")
+
+  workspace Workspace       @relation(fields: [workspaceId], references: [id])
+  city      City?           @relation(fields: [cityId], references: [id])
+  contacts  ClientContact[]
+  projects  Project[]
+  leads     Lead[]
+  invoices  Invoice[]
+
+  // One human = one client row. Postgres treats NULLs as distinct, so the
+  // many phone-less rows coexist while real numbers can never duplicate.
+  @@unique([workspaceId, phone])
+  /// BUG-002 fix: the idempotency key the real-data importer re-runs against.
+  /// Computed deterministically per source row (e.g. "AMM_CLIENT_DB:142") so a
+  /// re-run recognizes a row it already imported and skips it, rather than
+  /// depending only on phone (many rows have none) or Customer-ID-as-name
+  /// (not actually unique in the Cocktail Shop dump — see importRetail).
+  @@unique([workspaceId, externalRef])
+  @@index([workspaceId, cityId])
+  @@index([workspaceId, segment])
+  @@map("clients")
+}
+
+model ClientContact {
+  id        String    @id @default(uuid()) @db.Uuid
+  clientId  String    @map("client_id") @db.Uuid
+  name      String
+  phone     String?
+  email     String?
+  role      String?
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  client Client @relation(fields: [clientId], references: [id])
+
+  @@index([clientId])
+  @@map("client_contacts")
+}
+
+model Lead {
+  id          String    @id @default(uuid()) @db.Uuid
+  workspaceId String    @map("workspace_id") @db.Uuid
+  /// Company/organisation where the sheet gives one, else the person's name.
+  name        String
+  stage       LeadStage @default(LEAD)
+  kind        LeadKind  @default(PIPELINE)
+  /// Nullable: a cold prospect scraped from a bar directory has no deal value
+  /// yet, and defaulting it to 0 would quietly understate nothing while making
+  /// "never estimated" indistinguishable from "estimated at zero". Pipeline
+  /// forecasting must treat NULL as unestimated, not as 0.
+  value       Decimal?  @db.Decimal(14, 2)
+  /// Nullable: imported leads are unowned until a human picks them up.
+  ownerId     String?   @map("owner_id") @db.Uuid
+  /// Nullable for the same reason as Client.cityId — see that comment.
+  cityId      String?   @map("city_id") @db.Uuid
+
+  contactName String?   @map("contact_name")
+  phone       String?
+  phoneRaw    String?   @map("phone_raw")
+  email       String?
+  company     String?
+  designation String?
+  address     String?
+  website     String?
+  /// Lead source: `Planner Ref` for pipeline rows, sheet-derived otherwise.
+  source      String?
+  /// Exact source sheet, so a bad import batch can be traced or undone.
+  sourceSheet String?   @map("source_sheet")
+  sourceFile  String?   @map("source_file")
+  /// BUG-002 fix: idempotency key for re-running the real-data importer —
+  /// deterministic per source row (e.g. "PIPELINE:Sales Funnel:142"), since
+  /// most leads have no phone at all and dedupe cannot rely on that alone.
+  externalRef String?   @map("external_ref")
+  /// Free-text location as written; only mapped to cityId on exact matches.
+  locationText String?  @map("location_text")
+  eventType   String?   @map("event_type")
+  pax         Int?
+  eventDate   DateTime? @map("event_date")
+  /// The date exactly as the sheet wrote it, kept whenever it could not be
+  /// parsed into a real date without guessing — "9-12 July" (no year),
+  /// "Nov end". A human can resolve these; the importer must not.
+  eventDateText String? @map("event_date_text")
+  remarks     String?
+  /// Richer intake-form answers (bar size, services, prop display, ...).
+  intakeDetail Json?    @map("intake_detail")
+
+  convertedClientId String? @map("converted_client_id") @db.Uuid
+  convertedProjectId String? @map("converted_project_id") @db.Uuid
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  createdById String?   @map("created_by") @db.Uuid
+  updatedById String?   @map("updated_by") @db.Uuid
+  deletedAt   DateTime? @map("deleted_at")
+
+  workspace         Workspace @relation(fields: [workspaceId], references: [id])
+  owner             User?     @relation("LeadOwner", fields: [ownerId], references: [id])
+  city              City?     @relation(fields: [cityId], references: [id])
+  convertedClient   Client?   @relation(fields: [convertedClientId], references: [id])
+  /// A list, not a single project, because the partial unique index only
+  /// forbids more than one LIVE conversion — a conversion whose project was
+  /// later deleted stays here as history and does not block a fresh one.
+  conversions       Project[] @relation("LeadConversion")
+
+  // Enforces §6/§7 dedupe at the database, not just in the import script.
+  @@unique([workspaceId, phone])
+  @@unique([workspaceId, externalRef])
+  @@index([workspaceId, stage])
+  @@index([workspaceId, kind])
+  @@map("leads")
+}
+
+model Vendor {
+  id          String       @id @default(uuid()) @db.Uuid
+  workspaceId String       @map("workspace_id") @db.Uuid
+  name        String
+  /// Nullable: F&B supplier categorisation is a later UI pass (§4).
+  category    String?
+  /// Nullable for the same reason as Client.cityId — see that comment.
+  cityId      String?      @map("city_id") @db.Uuid
+  contactName String?      @map("contact_name")
+  email       String?
+  phone       String?
+  phoneRaw    String?      @map("phone_raw")
+  address     String?
+  source      String?
+  /// BUG-002 fix: idempotency key for re-running the real-data importer —
+  /// see Client.externalRef for why this exists.
+  externalRef String?      @map("external_ref")
+  rating      Decimal?     @db.Decimal(2, 1)
+  gstin       String?
+  /// From AMM's vendor sheet: which brand buys from them (CORPORATE, ELIXIR,
+  /// TCS), how to reach them, their tax and bank details, and how they are paid.
+  brand            String?
+  website          String?
+  pan              String?
+  bankName         String?   @map("bank_name")
+  bankAccountNo    String?   @map("bank_account_no")
+  bankIfsc         String?   @map("bank_ifsc")
+  upiId            String?   @map("upi_id")
+  paymentTerms     String?   @map("payment_terms")
+  creditDays       Int?      @map("credit_days")
+  /// The balance and payment dates as recorded on the sheet — a starting
+  /// point, not a computed figure (purchase orders drive the live number).
+  openingBalance   Decimal?  @map("opening_balance") @db.Decimal(14, 2)
+  lastPaymentAt    DateTime? @map("last_payment_at") @db.Date
+  nextPaymentDueAt DateTime? @map("next_payment_due_at") @db.Date
+  remarks          String?
+  status      VendorStatus @default(APPROVED)
+  createdAt   DateTime     @default(now()) @map("created_at")
+  updatedAt   DateTime     @updatedAt @map("updated_at")
+  createdById String?      @map("created_by") @db.Uuid
+  updatedById String?      @map("updated_by") @db.Uuid
+  deletedAt   DateTime?    @map("deleted_at")
+
+  workspace         Workspace          @relation(fields: [workspaceId], references: [id])
+  city              City?              @relation(fields: [cityId], references: [id])
+  contacts          VendorContact[]
+  projectVendors    ProjectVendor[]
+  purchaseRequests  PurchaseRequest[]
+  purchaseOrders    PurchaseOrder[]
+  inventoryItems    InventoryItem[]
+
+  @@unique([workspaceId, externalRef])
+  @@index([workspaceId, cityId])
+  @@map("vendors")
+}
+
+model VendorContact {
+  id        String    @id @default(uuid()) @db.Uuid
+  vendorId  String    @map("vendor_id") @db.Uuid
+  name      String
+  phone     String?
+  email     String?
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  vendor Vendor @relation(fields: [vendorId], references: [id])
+
+  @@index([vendorId])
+  @@map("vendor_contacts")
+}
+
+// =========================================================================
+// PLAYBOOKS / PROJECTS
+// =========================================================================
+
+model Playbook {
+  id                  String    @id @default(uuid()) @db.Uuid
+  workspaceId         String    @map("workspace_id") @db.Uuid
+  name                String
+  eventType           String    @map("event_type")
+  defaultStages       Json      @map("default_stages")
+  defaultTasks        Json      @map("default_tasks")
+  defaultFlowTemplateIds String[] @map("default_flow_template_ids") @db.Uuid
+  createdAt           DateTime  @default(now()) @map("created_at")
+  updatedAt           DateTime  @updatedAt @map("updated_at")
+  createdById         String?   @map("created_by") @db.Uuid
+  updatedById         String?   @map("updated_by") @db.Uuid
+  deletedAt           DateTime? @map("deleted_at")
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id])
+  projects  Project[]
+
+  @@map("playbooks")
+}
+
+model Project {
+  id          String        @id @default(uuid()) @db.Uuid
+  workspaceId String        @map("workspace_id") @db.Uuid
+  name        String
+  clientId    String        @map("client_id") @db.Uuid
+  playbookId  String?       @map("playbook_id") @db.Uuid
+  type        String
+  cityId      String        @map("city_id") @db.Uuid
+  eventDate   DateTime      @map("event_date")
+  /// The event date exactly as AMM's calendar records it — "26-27th Sept",
+  /// "29th Nov - Sangeet 2nd Dec - Haldi". eventDate above is the single
+  /// timestamp everything schedules against (health, SLAs, dashboards), and
+  /// for a multi-day booking it can only be the first day. Keeping the raw
+  /// string means the full booking is never lost to that reduction, and any
+  /// date parsed on import stays auditable against its source.
+  eventDateText String?     @map("event_date_text")
+  /// Where the row came from, for rows imported from the event calendar.
+  externalRef String?       @map("external_ref")
+  /// BUG-007. The lead this project was converted from — and the database's
+  /// own guarantee that a lead converts at most once.
+  ///
+  /// The guarantee is a PARTIAL unique index,
+  /// `WHERE converted_from_lead_id IS NOT NULL AND deleted_at IS NULL`,
+  /// created in migration 20260916120000_lead_conversion_idempotency. Prisma's
+  /// schema language cannot express a partial index, so it is declared there
+  /// and not here; do not "tidy" this into `@unique`, which would also make a
+  /// soft-deleted project block the lead from ever being converted again.
+  ///
+  /// It has to live on projects rather than on leads.converted_project_id,
+  /// because a second conversion UPDATEs that column on the same lead row —
+  /// there is no second row for an index to reject. Here the second
+  /// conversion is a second INSERT, which the index can and does refuse.
+  convertedFromLeadId String? @map("converted_from_lead_id") @db.Uuid
+  pmId        String        @map("pm_id") @db.Uuid
+  /// The department that owns this event. Null means "Operations by
+  /// default" — see ownerDepartmentKey() in the access-scope service.
+  primaryDeptId String?     @map("primary_dept_id") @db.Uuid
+  status      ProjectStatus @default(PLANNING)
+  health      ProjectHealth @default(GREEN) // computed, recalculated server-side (blueprint §19) — never client-set
+  revenue     Decimal       @default(0) @db.Decimal(14, 2)
+  estCost     Decimal       @default(0) @map("est_cost") @db.Decimal(14, 2)
+  actCost     Decimal       @default(0) @map("act_cost") @db.Decimal(14, 2)
+  createdAt   DateTime      @default(now()) @map("created_at")
+  updatedAt   DateTime      @updatedAt @map("updated_at")
+  createdById String?       @map("created_by") @db.Uuid
+  updatedById String?       @map("updated_by") @db.Uuid
+  deletedAt   DateTime?     @map("deleted_at")
+
+  workspace       Workspace         @relation(fields: [workspaceId], references: [id])
+  client          Client            @relation(fields: [clientId], references: [id])
+  playbook        Playbook?         @relation(fields: [playbookId], references: [id])
+  city            City              @relation(fields: [cityId], references: [id])
+  convertedFromLead Lead?           @relation("LeadConversion", fields: [convertedFromLeadId], references: [id])
+  pm              User              @relation("ProjectPM", fields: [pmId], references: [id])
+  primaryDept     Department?       @relation("ProjectPrimaryDepartment", fields: [primaryDeptId], references: [id])
+  supportingDepts ProjectDepartment[]
+  members         ProjectMember[]
+  vendors         ProjectVendor[]
+  tasks           Task[]
+  flowInstances   FlowInstance[]
+  invoices        Invoice[]
+  expenses        Expense[]
+  risks           Risk[]
+  approvals       Approval[]
+  documents       Document[]
+  licences        Licence[]
+  budgets         Budget[]
+  purchaseRequests PurchaseRequest[]
+  inventoryReservations InventoryReservation[]
+  channels        Channel[]
+  meetings        Meeting[]
+  runsheets       Runsheet[]
+  crewRequests    CrewRequest[]
+  eventDayCheckins EventDayCheckin[]
+  eventDayIncidents EventDayIncident[]
+  emails          Email[]
+
+  @@unique([workspaceId, externalRef])
+  @@index([workspaceId, cityId, status])
+  @@map("projects")
+}
+
+model ProjectMember {
+  id           String            @id @default(uuid()) @db.Uuid
+  projectId    String            @map("project_id") @db.Uuid
+  userId       String            @map("user_id") @db.Uuid
+  roleOnProject ProjectMemberRole @default(TEAM_MEMBER) @map("role_on_project")
+  createdAt    DateTime          @default(now()) @map("created_at")
+  deletedAt    DateTime?         @map("deleted_at")
+
+  project Project @relation(fields: [projectId], references: [id])
+  user    User    @relation(fields: [userId], references: [id])
+
+  @@unique([projectId, userId])
+  @@map("project_members")
+}
+
+model ProjectVendor {
+  id        String    @id @default(uuid()) @db.Uuid
+  projectId String    @map("project_id") @db.Uuid
+  vendorId  String    @map("vendor_id") @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  project Project @relation(fields: [projectId], references: [id])
+  vendor  Vendor  @relation(fields: [vendorId], references: [id])
+
+  @@unique([projectId, vendorId])
+  @@map("project_vendors")
+}
+
+// =========================================================================
+// TASKS
+// =========================================================================
+
+model Task {
+  id          String       @id @default(uuid()) @db.Uuid
+  projectId   String       @map("project_id") @db.Uuid
+  name        String
+  ownerId     String       @map("owner_id") @db.Uuid
+  dueAt       DateTime?    @map("due_at")
+  status      TaskStatus   @default(BACKLOG)
+  priority    TaskPriority @default(MEDIUM)
+  sourceMessageId String?  @map("source_message_id") @db.Uuid // set when created via chat @mention
+  /// The department responsible for the task. A task whose primary
+  /// department differs from its project's is the cross-department
+  /// dependency: the supporting team reaches the task, not the whole event.
+  primaryDeptId   String?  @map("primary_dept_id") @db.Uuid
+  createdAt   DateTime     @default(now()) @map("created_at")
+  updatedAt   DateTime     @updatedAt @map("updated_at")
+  createdById String?      @map("created_by") @db.Uuid
+  updatedById String?      @map("updated_by") @db.Uuid
+  deletedAt   DateTime?    @map("deleted_at")
+
+  project      Project            @relation(fields: [projectId], references: [id])
+  owner        User               @relation("TaskOwner", fields: [ownerId], references: [id])
+  primaryDept  Department?        @relation("TaskPrimaryDepartment", fields: [primaryDeptId], references: [id])
+  supportingDepts TaskDepartment[]
+  dependencies TaskDependency[]   @relation("TaskDependent")
+  dependents   TaskDependency[]   @relation("TaskDependsOn")
+
+  @@index([projectId, status])
+  @@map("tasks")
+}
+
+model TaskDependency {
+  id            String @id @default(uuid()) @db.Uuid
+  taskId        String @map("task_id") @db.Uuid
+  dependsOnTaskId String @map("depends_on_task_id") @db.Uuid
+
+  task        Task @relation("TaskDependent", fields: [taskId], references: [id])
+  dependsOnTask Task @relation("TaskDependsOn", fields: [dependsOnTaskId], references: [id])
+
+  @@unique([taskId, dependsOnTaskId])
+  @@map("task_dependencies")
+}
+
+// =========================================================================
+// FLOW ENGINE — the platform's differentiator (blueprint §6)
+// =========================================================================
+
+/// Reusable flow definition. `steps` jsonb mirrors the prototype's
+/// FLOW_TEMPLATES shape (key, name, role, default owner role, sla minutes,
+/// deps[]) for import/export and playbook authoring convenience; the
+/// authoritative, queryable structure once instantiated is FlowStep +
+/// FlowStepDependency below — jsonb here is a template, not the runtime model.
+model FlowTemplate {
+  id          String    @id @default(uuid()) @db.Uuid
+  workspaceId String    @map("workspace_id") @db.Uuid
+  name        String
+  category    String
+  description String?
+  steps       Json // [{key, name, role, ownerRole, slaMinutes, deps: [key,...]}]
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  createdById String?   @map("created_by") @db.Uuid
+  updatedById String?   @map("updated_by") @db.Uuid
+  deletedAt   DateTime? @map("deleted_at")
+
+  workspace     Workspace      @relation(fields: [workspaceId], references: [id])
+  flowInstances FlowInstance[]
+
+  @@map("flow_templates")
+}
+
+model FlowInstance {
+  id         String             @id @default(uuid()) @db.Uuid
+  templateId String             @map("template_id") @db.Uuid
+  projectId  String             @map("project_id") @db.Uuid
+  name       String
+  status     FlowInstanceStatus @default(ACTIVE)
+  createdAt  DateTime           @default(now()) @map("created_at")
+  updatedAt  DateTime           @updatedAt @map("updated_at")
+  createdById String?           @map("created_by") @db.Uuid
+  deletedAt  DateTime?          @map("deleted_at")
+
+  template FlowTemplate @relation(fields: [templateId], references: [id])
+  project  Project      @relation(fields: [projectId], references: [id])
+  steps    FlowStep[]
+
+  @@index([projectId, status])
+  @@map("flow_instances")
+}
+
+model FlowStep {
+  id             String         @id @default(uuid()) @db.Uuid
+  flowInstanceId String         @map("flow_instance_id") @db.Uuid
+  key            String // matches template step key, e.g. 'a','b','c'
+  name           String
+  role           String
+  ownerId        String         @map("owner_id") @db.Uuid
+  slaMinutes     Int            @map("sla_minutes")
+  status         FlowStepStatus @default(LOCKED)
+  readyAt        DateTime?      @map("ready_at")
+  startedAt      DateTime?      @map("started_at")
+  doneAt         DateTime?      @map("done_at")
+  note           String?
+
+  /// BUG-005. Escalation is a FLAG on the step, never the step's status.
+  ///
+  /// It used to be a status: the SLA sweep set `status = ESCALATED`, which
+  /// overwrote READY or ACTIVE and destroyed the only record of where the
+  /// work had got to. Worse, `startStep` requires READY and `completeStep`
+  /// requires READY or ACTIVE, so escalating a step made it permanently
+  /// impossible to start or finish — a notification mechanism silently
+  /// removed the work item from the workflow.
+  ///
+  /// `escalationLevel` is 0 until the first breach, then 1, 2, 3 as the
+  /// breach deepens. It is what makes the sweep idempotent: a level is acted
+  /// on only when it is HIGHER than the level already recorded, so re-running
+  /// the same sweep over the same step does nothing a second time.
+  ///
+  /// The FlowStepStatus.ESCALATED enum value is deliberately kept. Historic
+  /// flow_step_runs rows record transitions *to* ESCALATED and must stay
+  /// readable; nothing sets it as a step's status any more.
+  escalatedAt     DateTime?     @map("escalated_at")
+  escalationLevel Int           @default(0) @map("escalation_level")
+  /// The risk raised by the first escalation, so deeper levels sharpen that
+  /// same risk instead of raising a new one per level.
+  escalationRiskId String?      @map("escalation_risk_id") @db.Uuid
+  createdAt      DateTime       @default(now()) @map("created_at")
+  updatedAt      DateTime       @updatedAt @map("updated_at")
+  deletedAt      DateTime?      @map("deleted_at")
+
+  flowInstance FlowInstance          @relation(fields: [flowInstanceId], references: [id])
+  owner        User                  @relation("FlowStepOwner", fields: [ownerId], references: [id])
+  dependsOn    FlowStepDependency[]  @relation("StepDependent")
+  dependents   FlowStepDependency[]  @relation("StepDependsOn")
+  runs         FlowStepRun[]
+
+  @@unique([flowInstanceId, key])
+  @@index([flowInstanceId, status])
+  @@index([ownerId, status])
+  @@map("flow_steps")
+}
+
+model FlowStepDependency {
+  id              String   @id @default(uuid()) @db.Uuid
+  stepId          String   @map("step_id") @db.Uuid
+  dependsOnStepId String   @map("depends_on_step_id") @db.Uuid
+  joinType        JoinType @default(AND) @map("join_type")
+
+  step          FlowStep @relation("StepDependent", fields: [stepId], references: [id])
+  dependsOnStep FlowStep @relation("StepDependsOn", fields: [dependsOnStepId], references: [id])
+
+  @@unique([stepId, dependsOnStepId])
+  @@map("flow_step_dependencies")
+}
+
+/// Immutable transition log — the flow engine's audit trail and the source
+/// for bottleneck analytics (blueprint §6/§52). Never updated, never deleted.
+model FlowStepRun {
+  id         String         @id @default(uuid()) @db.Uuid
+  stepId     String         @map("step_id") @db.Uuid
+  fromStatus FlowStepStatus @map("from_status")
+  toStatus   FlowStepStatus @map("to_status")
+  actorId    String?        @map("actor_id") @db.Uuid // null for system/SLA-timer transitions
+  at         DateTime       @default(now())
+
+  step FlowStep @relation(fields: [stepId], references: [id])
+
+  @@index([stepId])
+  @@map("flow_step_runs")
+}
+
+// =========================================================================
+// INVENTORY — ledger-based, never a raw editable quantity (blueprint §14)
+// =========================================================================
+
+model InventoryItem {
+  id                String    @id @default(uuid()) @db.Uuid
+  workspaceId       String    @map("workspace_id") @db.Uuid
+  sku               String
+  name              String
+  category          String
+  unit              String
+  sizeMl            Int?      @map("size_ml")
+  standardCost      Decimal   @map("standard_cost") @db.Decimal(12, 2)
+  preferredVendorId String?   @map("preferred_vendor_id") @db.Uuid
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+  deletedAt         DateTime? @map("deleted_at")
+
+  workspace       Workspace              @relation(fields: [workspaceId], references: [id])
+  preferredVendor Vendor?                @relation(fields: [preferredVendorId], references: [id])
+  balances        InventoryBalance[]
+  purchaseOrderItems PurchaseOrderItem[]
+  movements       InventoryMovement[]
+  reservations    InventoryReservation[]
+  recipeItems     RecipeItem[]
+
+  @@unique([workspaceId, sku])
+  @@map("inventory_items")
+}
+
+model InventoryLocation {
+  id        String    @id @default(uuid()) @db.Uuid
+  cityId    String    @map("city_id") @db.Uuid
+  name      String
+  createdAt DateTime  @default(now()) @map("created_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  city      City                   @relation(fields: [cityId], references: [id])
+  balances  InventoryBalance[]
+  movementsFrom InventoryMovement[] @relation("MovementFromLocation")
+  movementsTo   InventoryMovement[] @relation("MovementToLocation")
+  reservations  InventoryReservation[]
+
+  @@unique([cityId, name])
+  @@map("inventory_locations")
+  goodsReceipts     GoodsReceipt[]
+}
+
+/// Derived-only. Never written to directly — recomputed from
+/// inventory_movements (via trigger or transactional recompute), row-locked
+/// with SELECT ... FOR UPDATE during any movement. This is the fix for the
+/// prototype's `qty[cityIdx] -= n` in-place mutation (blueprint §14).
+model InventoryBalance {
+  id            String   @id @default(uuid()) @db.Uuid
+  skuId         String   @map("sku_id") @db.Uuid
+  locationId    String   @map("location_id") @db.Uuid
+  qtyOnHand     Int      @default(0) @map("qty_on_hand")
+  reorderLevel  Int      @default(0) @map("reorder_level")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  item     InventoryItem     @relation(fields: [skuId], references: [id])
+  location InventoryLocation @relation(fields: [locationId], references: [id])
+
+  @@unique([skuId, locationId])
+  @@map("inventory_balances")
+}
+
+model InventoryMovement {
+  id             String                @id @default(uuid()) @db.Uuid
+  skuId          String                @map("sku_id") @db.Uuid
+  type           InventoryMovementType
+  fromLocationId String?               @map("from_location_id") @db.Uuid
+  toLocationId   String?               @map("to_location_id") @db.Uuid
+  qty            Int
+  refType        String?               @map("ref_type") // e.g. "goods_receipt", "project", "adjustment"
+  refId          String?               @map("ref_id") @db.Uuid
+  actorId        String                @map("actor_id") @db.Uuid
+  note           String?
+  idempotencyKey String?               @unique @map("idempotency_key")
+  createdAt      DateTime              @default(now()) @map("created_at")
+
+  item         InventoryItem      @relation(fields: [skuId], references: [id])
+  fromLocation InventoryLocation? @relation("MovementFromLocation", fields: [fromLocationId], references: [id])
+  toLocation   InventoryLocation? @relation("MovementToLocation", fields: [toLocationId], references: [id])
+
+  @@index([skuId, createdAt])
+  @@map("inventory_movements")
+}
+
+model InventoryReservation {
+  id         String            @id @default(uuid()) @db.Uuid
+  skuId      String            @map("sku_id") @db.Uuid
+  locationId String            @map("location_id") @db.Uuid
+  projectId  String            @map("project_id") @db.Uuid
+  qty        Int
+  status     ReservationStatus @default(RESERVED)
+  createdAt  DateTime          @default(now()) @map("created_at")
+  updatedAt  DateTime          @updatedAt @map("updated_at")
+
+  item     InventoryItem     @relation(fields: [skuId], references: [id])
+  location InventoryLocation @relation(fields: [locationId], references: [id])
+  project  Project           @relation(fields: [projectId], references: [id])
+
+  @@index([skuId, locationId, status])
+  @@map("inventory_reservations")
+}
+
+// =========================================================================
+// MENU COSTING
+// =========================================================================
+
+// A trading brand under AMM Brands LLP. AMM invoices as one legal entity
+// (one GSTIN, one bank account) but sells under distinct brands — Elixir
+// Coterie for event bar and catering, The Cocktail Shop for retail product —
+// and an invoice is issued under one of them. The GSTIN lives on Workspace,
+// not here, precisely because it is the LLP's and is shared.
+model Brand {
+  id          String    @id @default(uuid()) @db.Uuid
+  workspaceId String    @map("workspace_id") @db.Uuid
+  name        String
+  code        String // ELIXIR, TCS
+  /// Printed under the letterhead on that brand's documents.
+  tagline     String?
+  website     String?
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  deletedAt   DateTime? @map("deleted_at")
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id])
+  products  Product[]
+  invoices  Invoice[]
+
+  @@unique([workspaceId, code])
+  @@map("brands")
+}
+
+// The sellable catalogue, for both brands. Deliberately separate from
+// InventoryItem: that tracks physical stock moving in and out of a location,
+// whereas this is what may appear as a line on an invoice — including
+// services ("Bartenders — premium cocktail service") that hold no stock.
+model Product {
+  id          String             @id @default(uuid()) @db.Uuid
+  workspaceId String             @map("workspace_id") @db.Uuid
+  brandId     String             @map("brand_id") @db.Uuid
+  /// Stable key from the source export, so re-importing updates rather than duplicating.
+  externalRef String             @map("external_ref")
+  /// The brand's own code where it has one (TCS-D-001). Elixir has none.
+  sku         String?
+  name        String
+  /// Elixir's serviceId (bar, hookah, chai_adda…) or TCS's product type.
+  serviceLine String?            @map("service_line")
+  category    String?
+  shortDesc   String?            @map("short_desc")
+  longDesc    String?            @map("long_desc")
+  unit        String?
+  /// Excluding GST, always — the TCS sheet carries both and only this is stored.
+  price       Decimal            @default(0) @db.Decimal(14, 2)
+  pricingMode ProductPricingMode @default(PER_QUANTITY) @map("pricing_mode")
+  /// Fractional rate as filed, e.g. 0.18 for 18%.
+  gstRate     Decimal?           @map("gst_rate") @db.Decimal(5, 4)
+  hsnSac      String?            @map("hsn_sac")
+  isActive    Boolean            @default(true) @map("is_active")
+  /// TCS only; the Elixir catalogue is service-led and holds no stock.
+  stockQty    Decimal?           @map("stock_qty") @db.Decimal(14, 2)
+  vendorName  String?            @map("vendor_name")
+  /// Site-relative path to the product photo, e.g. "/products/TCS-E-044.jpg".
+  /// Served as a static file by the app itself — see scripts/map-product-images.ts.
+  imageUrl    String?            @map("image_url")
+  /// Notes the source flagged on the row (duplicate SKU, missing price).
+  sourceFlag  String?            @map("source_flag")
+  sourceFile  String?            @map("source_file")
+  createdAt   DateTime           @default(now()) @map("created_at")
+  updatedAt   DateTime           @updatedAt @map("updated_at")
+  deletedAt   DateTime?          @map("deleted_at")
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id])
+  brand     Brand     @relation(fields: [brandId], references: [id])
+
+  @@unique([workspaceId, externalRef])
+  @@index([workspaceId, brandId, category])
+  @@map("products")
+}
+
+model Recipe {
+  id          String    @id @default(uuid()) @db.Uuid
+  workspaceId String    @map("workspace_id") @db.Uuid
+  name        String
+  glass       String
+  /// Recipe-book detail: base spirit (Whiskey, Vodka, Gin…), how it's made,
+  /// the garnish, and anything to verify against the original notes.
+  spirit      String?
+  method      String?
+  garnish     String?
+  notes       String?
+  garnishCost Decimal   @default(0) @map("garnish_cost") @db.Decimal(10, 2)
+  /// 0 = not priced yet (recipe-book entries carry no menu price).
+  price       Decimal   @default(0) @db.Decimal(10, 2)
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  deletedAt   DateTime? @map("deleted_at")
+
+  workspace Workspace    @relation(fields: [workspaceId], references: [id])
+  items     RecipeItem[]
+
+  @@map("recipes")
+}
+
+/// One ingredient line. `ingredient` is the name as written ("Bourbon
+/// whiskey", "Lime juice"); linking it to a stock item (`skuId`) is optional
+/// and is what makes the line costable and checkable against store stock.
+/// `qty` + `unit` are as written (60 ml, 3 dash, 1 cube, "as needed" = null
+/// qty); `qtyMax` holds the top of a range (8–10 leaves). `qtyMl` is the
+/// volume in ml, 0 for non-volume units — what costing and liquid totals use.
+model RecipeItem {
+  id         String   @id @default(uuid()) @db.Uuid
+  recipeId   String   @map("recipe_id") @db.Uuid
+  skuId      String?  @map("sku_id") @db.Uuid
+  ingredient String   @default("")
+  qty        Decimal? @db.Decimal(10, 2)
+  qtyMax     Decimal? @map("qty_max") @db.Decimal(10, 2)
+  unit       String   @default("ml")
+  note       String?
+  position   Int      @default(0)
+  qtyMl      Int      @default(0) @map("qty_ml")
+
+  recipe Recipe         @relation(fields: [recipeId], references: [id])
+  item   InventoryItem? @relation(fields: [skuId], references: [id])
+
+  @@map("recipe_items")
+}
+
+// =========================================================================
+// PROCUREMENT
+// =========================================================================
+
+model PurchaseRequest {
+  id        String                @id @default(uuid()) @db.Uuid
+  projectId String?               @map("project_id") @db.Uuid // nullable — store replenishment PRs aren't project-scoped
+  cityId    String?               @map("city_id") @db.Uuid
+  item      String
+  vendorId  String                @map("vendor_id") @db.Uuid
+  amount    Decimal               @db.Decimal(14, 2)
+  status    PurchaseRequestStatus @default(QUOTE_COMPARISON)
+  notes     String?
+  requestedById String?           @map("requested_by") @db.Uuid
+  createdAt DateTime              @default(now()) @map("created_at")
+  updatedAt DateTime              @updatedAt @map("updated_at")
+  createdById String?             @map("created_by") @db.Uuid
+  deletedAt DateTime?             @map("deleted_at")
+
+  project        Project?        @relation(fields: [projectId], references: [id])
+  vendor         Vendor          @relation(fields: [vendorId], references: [id])
+  purchaseOrders PurchaseOrder[]
+  approvals      Approval[]
+
+  @@index([status])
+  @@map("purchase_requests")
+}
+
+model PurchaseOrder {
+  id            String              @id @default(uuid()) @db.Uuid
+  prId          String              @map("pr_id") @db.Uuid
+  vendorId      String              @map("vendor_id") @db.Uuid
+  total         Decimal             @db.Decimal(14, 2)
+  status        PurchaseOrderStatus @default(DRAFT)
+  idempotencyKey String?            @unique @map("idempotency_key")
+  createdAt     DateTime            @default(now()) @map("created_at")
+  updatedAt     DateTime            @updatedAt @map("updated_at")
+  createdById   String?             @map("created_by") @db.Uuid
+  deletedAt     DateTime?           @map("deleted_at")
+
+  purchaseRequest PurchaseRequest     @relation(fields: [prId], references: [id])
+  vendor          Vendor              @relation(fields: [vendorId], references: [id])
+  goodsReceipts   GoodsReceipt[]
+  items           PurchaseOrderItem[]
+
+  @@map("purchase_orders")
+}
+
+/// What was actually ordered, per SKU. Without this a "partial receipt" has
+/// nothing to be partial against, and a goods receipt has no way to know which
+/// inventory item to move or at what cost.
+model PurchaseOrderItem {
+  id          String  @id @default(uuid()) @db.Uuid
+  poId        String  @map("po_id") @db.Uuid
+  skuId       String  @map("sku_id") @db.Uuid
+  qtyOrdered  Int     @map("qty_ordered")
+  unitPrice   Decimal @map("unit_price") @db.Decimal(12, 2)
+
+  purchaseOrder PurchaseOrder @relation(fields: [poId], references: [id])
+  sku           InventoryItem @relation(fields: [skuId], references: [id])
+
+  @@unique([poId, skuId])
+  @@map("purchase_order_items")
+}
+
+model GoodsReceipt {
+  id           String   @id @default(uuid()) @db.Uuid
+  poId         String   @map("po_id") @db.Uuid
+  receivedQty  Json     @map("received_qty") // partial-receipt aware: {skuId: qty, ...}
+  /// Which warehouse the goods physically landed in. Required: a RECEIVE
+  /// movement with no destination cannot be reconciled against a balance.
+  locationId   String   @map("location_id") @db.Uuid
+  note         String?
+  receivedAt   DateTime @default(now()) @map("received_at")
+  receivedById String   @map("received_by") @db.Uuid
+
+  purchaseOrder PurchaseOrder     @relation(fields: [poId], references: [id])
+  location      InventoryLocation @relation(fields: [locationId], references: [id])
+
+  @@map("goods_receipts")
+}
+
+// =========================================================================
+// FINANCE — BUDGETS / EXPENSES
+// =========================================================================
+
+model Budget {
+  id        String    @id @default(uuid()) @db.Uuid
+  projectId String    @map("project_id") @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  createdById String? @map("created_by") @db.Uuid
+  deletedAt DateTime? @map("deleted_at")
+
+  project Project      @relation(fields: [projectId], references: [id])
+  lines   BudgetLine[]
+
+  @@map("budgets")
+}
+
+model BudgetLine {
+  id            String  @id @default(uuid()) @db.Uuid
+  budgetId      String  @map("budget_id") @db.Uuid
+  category      String
+  plannedAmount Decimal @map("planned_amount") @db.Decimal(14, 2)
+
+  budget Budget @relation(fields: [budgetId], references: [id])
+
+  @@map("budget_lines")
+}
+
+model Expense {
+  id        String        @id @default(uuid()) @db.Uuid
+  /// The claimant — the person who spent the money and is owed it back.
+  /// Deliberately distinct from `approvedById`: an expense claim approved by
+  /// its own claimant is the textbook reimbursement-fraud path, so
+  /// ExpensesService refuses it.
+  userId    String        @map("user_id") @db.Uuid
+  projectId String        @map("project_id") @db.Uuid
+  category  String
+  amount    Decimal       @db.Decimal(12, 2)
+  status    ExpenseStatus @default(PENDING)
+  note      String?
+  incurredAt DateTime     @default(now()) @map("incurred_at")
+  /// Who decided, when, and why — an approval workflow that moves real money
+  /// without recording its approver is not an audit trail.
+  approvedById   String?   @map("approved_by") @db.Uuid
+  decidedAt      DateTime? @map("decided_at")
+  decisionReason String?   @map("decision_reason")
+  reimbursedAt   DateTime? @map("reimbursed_at")
+  /// Financial record — idempotent creation, same header pattern as invoices,
+  /// payments and inventory movements (blueprint §30).
+  idempotencyKey String?   @unique @map("idempotency_key")
+  createdAt DateTime      @default(now()) @map("created_at")
+  updatedAt DateTime      @updatedAt @map("updated_at")
+  deletedAt DateTime?     @map("deleted_at")
+
+  user       User    @relation(fields: [userId], references: [id])
+  approvedBy User?   @relation("ExpenseApprover", fields: [approvedById], references: [id])
+  project    Project @relation(fields: [projectId], references: [id])
+
+  @@index([userId, status])
+  @@index([projectId, status])
+  @@map("expenses")
+}
+
+// =========================================================================
+// INVOICING — GST-correct, immutable once issued (blueprint §17)
+// =========================================================================
+
+/// One gap-free sequence counter per (city, financial year). Locked with
+/// SELECT ... FOR UPDATE when issuing an invoice, inside the same transaction
+/// that inserts the invoice row — this is what makes AMM/{CITY}/{FY}/{SEQ}
+/// sequential and never reused.
+model InvoiceCounter {
+  id            String @id @default(uuid()) @db.Uuid
+  workspaceId   String @map("workspace_id") @db.Uuid
+  cityId        String @map("city_id") @db.Uuid
+  financialYear String @map("financial_year") // e.g. "26-27"
+  lastSequence  Int    @default(0) @map("last_sequence")
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id])
+  city      City      @relation(fields: [cityId], references: [id])
+
+  @@unique([cityId, financialYear])
+  @@map("invoice_counters")
+}
+
+model Invoice {
+  id             String        @id @default(uuid()) @db.Uuid
+  workspaceId    String        @map("workspace_id") @db.Uuid
+  invoiceNo      String        @unique @map("invoice_no") // AMM/{CITY_CODE}/{FY}/{SEQ}
+  clientId       String        @map("client_id") @db.Uuid
+  projectId      String        @map("project_id") @db.Uuid
+  cityId         String        @map("city_id") @db.Uuid
+  /// Which trading brand the document is issued under. Nullable because every
+  /// invoice raised before brands existed has no answer, and assigning one
+  /// retrospectively would be inventing a fact about a tax document.
+  brandId        String?        @map("brand_id") @db.Uuid
+  docType        InvoiceDocType @default(TAX_INVOICE) @map("doc_type")
+  issueDate      DateTime?     @map("issue_date")
+  dueDate        DateTime      @map("due_date")
+  status         InvoiceStatus @default(DRAFT)
+  placeOfSupply  String        @map("place_of_supply") // GST state code of the client
+  taxableAmount  Decimal       @default(0) @map("taxable_amount") @db.Decimal(14, 2)
+  cgst           Decimal       @default(0) @db.Decimal(14, 2)
+  sgst           Decimal       @default(0) @db.Decimal(14, 2)
+  igst           Decimal       @default(0) @db.Decimal(14, 2)
+  total          Decimal       @default(0) @db.Decimal(14, 2)
+  /// Printed on the document. Free text because AMM writes them per deal
+  /// ("50% advance, balance on event date").
+  paymentTerms    String?      @map("payment_terms")
+  /// "Quotation ref. 43 dated 17 May 2026" on the supplied layout.
+  quotationRef    String?      @map("quotation_ref")
+  /// Where the work happens, which is not always the billing address.
+  serviceLocation String?      @map("service_location")
+  /// Rounding applied to reach the printed grand total, signed.
+  roundOff       Decimal       @default(0) @map("round_off") @db.Decimal(6, 2)
+  idempotencyKey String?       @unique @map("idempotency_key")
+  createdAt      DateTime      @default(now()) @map("created_at")
+  updatedAt      DateTime      @updatedAt @map("updated_at")
+  createdById    String?       @map("created_by") @db.Uuid
+  deletedAt      DateTime?     @map("deleted_at")
+
+  workspace   Workspace     @relation(fields: [workspaceId], references: [id])
+  brand       Brand?        @relation(fields: [brandId], references: [id])
+  client      Client        @relation(fields: [clientId], references: [id])
+  project     Project       @relation(fields: [projectId], references: [id])
+  city        City          @relation(fields: [cityId], references: [id])
+  items       InvoiceItem[]
+  payments    Payment[]
+  creditNotes CreditNote[]
+  debitNotes  DebitNote[]
+
+  @@index([workspaceId, cityId, status])
+  @@map("invoices")
+}
+
+model InvoiceItem {
+  id          String  @id @default(uuid()) @db.Uuid
+  invoiceId   String  @map("invoice_id") @db.Uuid
+  description String
+  /// The smaller italic line under the description on the printed invoice.
+  detail      String?
+  qty         Decimal @default(1) @db.Decimal(10, 2)
+  /// The noun after the quantity — "8 person", "2 counter", "1 job".
+  unit        String?
+  rate        Decimal @db.Decimal(14, 2)
+  /// Percentage off the line, e.g. 5 for the 5% on bartenders. Stored as a
+  /// rate, not an amount: the document prints the rate, and holding both
+  /// lets them disagree the moment someone edits one.
+  discountPct Decimal      @default(0) @map("discount_pct") @db.Decimal(5, 2)
+  hsnSac      String?      @map("hsn_sac")
+  /// GST rate for this line as a fraction (0.18 = 18%). Goods carry their own
+  /// rate — The Cocktail Shop sells items at 0%, 5%, 12% and 18% — so a single
+  /// invoice-wide rate would misstate tax on mixed invoices. Defaults to 18%,
+  /// the rate every line had before this column existed.
+  gstRate     Decimal      @default(0.18) @map("gst_rate") @db.Decimal(5, 4)
+  scope       InvoiceScope @default(FIXED)
+  /// Print order within a scope section; the document numbers lines 01, 02…
+  sortOrder   Int          @default(0) @map("sort_order")
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id])
+
+  @@index([invoiceId, scope, sortOrder])
+  @@map("invoice_items")
+}
+
+model Payment {
+  id             String        @id @default(uuid()) @db.Uuid
+  invoiceId      String        @map("invoice_id") @db.Uuid
+  amount         Decimal       @db.Decimal(14, 2)
+  method         PaymentMethod
+  receivedAt     DateTime      @default(now()) @map("received_at")
+  idempotencyKey String?       @unique @map("idempotency_key")
+  createdById    String?       @map("created_by") @db.Uuid
+  createdAt      DateTime      @default(now()) @map("created_at")
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id])
+
+  @@index([invoiceId])
+  @@map("payments")
+}
+
+/// Corrections to an issued invoice never UPDATE the invoice row — they are
+/// always a new credit or debit note (blueprint §17/§22/§59).
+model CreditNote {
+  id        String   @id @default(uuid()) @db.Uuid
+  invoiceId String   @map("invoice_id") @db.Uuid
+  amount    Decimal  @db.Decimal(14, 2)
+  reason    String
+  createdAt DateTime @default(now()) @map("created_at")
+  createdById String? @map("created_by") @db.Uuid
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id])
+
+  @@map("credit_notes")
+}
+
+model DebitNote {
+  id        String   @id @default(uuid()) @db.Uuid
+  invoiceId String   @map("invoice_id") @db.Uuid
+  amount    Decimal  @db.Decimal(14, 2)
+  reason    String
+  createdAt DateTime @default(now()) @map("created_at")
+  createdById String? @map("created_by") @db.Uuid
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id])
+
+  @@map("debit_notes")
+}
+
+// =========================================================================
+// COMPLIANCE
+// =========================================================================
+
+model Licence {
+  id                    String        @id @default(uuid()) @db.Uuid
+  workspaceId           String        @map("workspace_id") @db.Uuid
+  projectId             String?       @map("project_id") @db.Uuid // null = company-wide (e.g. FSSAI)
+  type                  String
+  authority             String
+  cityId                String        @map("city_id") @db.Uuid
+  status                LicenceStatus @default(NOT_APPLIED)
+  refNo                 String?       @map("ref_no")
+  dueDate               DateTime      @map("due_date")
+  ownerId               String        @map("owner_id") @db.Uuid
+  escalationOffsetDays  Int           @default(7) @map("escalation_offset_days") // configurable, generalizes the prototype's hardcoded T-7
+  createdAt             DateTime      @default(now()) @map("created_at")
+  updatedAt             DateTime      @updatedAt @map("updated_at")
+  deletedAt             DateTime?     @map("deleted_at")
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id])
+  project   Project?  @relation(fields: [projectId], references: [id])
+  city      City      @relation(fields: [cityId], references: [id])
+  owner     User      @relation("LicenceOwner", fields: [ownerId], references: [id])
+
+  @@index([cityId, status])
+  @@map("licences")
+}
+
+// =========================================================================
+// RISKS / APPROVALS / DOCUMENTS
+// =========================================================================
+
+model Risk {
+  id        String       @id @default(uuid()) @db.Uuid
+  projectId String       @map("project_id") @db.Uuid
+  title     String
+  severity  RiskSeverity
+  ownerId   String       @map("owner_id") @db.Uuid
+  impact    String?
+  status    RiskStatus   @default(OPEN)
+  sourceIncidentId String? @map("source_incident_id") @db.Uuid // set when auto-raised from an event-day incident
+  createdAt DateTime     @default(now()) @map("created_at")
+  updatedAt DateTime     @updatedAt @map("updated_at")
+  deletedAt DateTime?    @map("deleted_at")
+
+  project Project @relation(fields: [projectId], references: [id])
+  owner   User    @relation("RiskOwner", fields: [ownerId], references: [id])
+
+  @@index([projectId, status])
+  @@map("risks")
+}
+
+model Approval {
+  id            String         @id @default(uuid()) @db.Uuid
+  /// Nullable because a store-replenishment purchase request has no project,
+  /// but still has to pass the same approval gate as a project purchase.
+  projectId     String?        @map("project_id") @db.Uuid
+  purchaseRequestId String?    @map("purchase_request_id") @db.Uuid
+  title         String
+  type          ApprovalType
+  requesterId   String         @map("requester_id") @db.Uuid
+  approverRef   String         @map("approver_ref") // free-text external approver (client contact name) or user id for internal
+  status        ApprovalStatus @default(PENDING)
+  approvalLevel Int            @default(1) @map("approval_level")
+  decidedAt     DateTime?      @map("decided_at")
+  decisionReason String?       @map("decision_reason")
+  createdAt     DateTime       @default(now()) @map("created_at")
+  updatedAt     DateTime       @updatedAt @map("updated_at")
+  deletedAt     DateTime?      @map("deleted_at")
+
+  project         Project?         @relation(fields: [projectId], references: [id])
+  purchaseRequest PurchaseRequest? @relation(fields: [purchaseRequestId], references: [id])
+
+  @@index([projectId, status])
+  @@index([purchaseRequestId])
+  @@map("approvals")
+}
+
+model Document {
+  id          String       @id @default(uuid()) @db.Uuid
+  workspaceId String       @map("workspace_id") @db.Uuid
+  projectId   String?      @map("project_id") @db.Uuid
+  name        String
+  type        DocumentType
+  createdAt   DateTime     @default(now()) @map("created_at")
+  updatedAt   DateTime     @updatedAt @map("updated_at")
+  createdById String?      @map("created_by") @db.Uuid
+  deletedAt   DateTime?    @map("deleted_at")
+
+  workspace Workspace         @relation(fields: [workspaceId], references: [id])
+  project   Project?          @relation(fields: [projectId], references: [id])
+  versions  DocumentVersion[]
+
+  @@index([projectId])
+  @@map("documents")
+}
+
+model DocumentVersion {
+  id           String   @id @default(uuid()) @db.Uuid
+  documentId   String   @map("document_id") @db.Uuid
+  versionNo    Int      @map("version_no")
+  storageKey   String   @map("storage_key")
+  // Phase F: a storage key alone can't round-trip a real file — a download
+  // needs the original filename and MIME type back, and a list view needs
+  // the size without touching the storage driver. Added with this phase's
+  // upload endpoint since there was no prior code depending on their absence.
+  fileName     String   @map("file_name")
+  mimeType     String   @map("mime_type")
+  sizeBytes    Int      @map("size_bytes")
+  uploadedById String   @map("uploaded_by") @db.Uuid
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  document Document @relation(fields: [documentId], references: [id])
+
+  @@unique([documentId, versionNo])
+  @@map("document_versions")
+}
+
+// =========================================================================
+// CHAT
+// =========================================================================
+
+model Channel {
+  id          String      @id @default(uuid()) @db.Uuid
+  workspaceId String      @map("workspace_id") @db.Uuid
+  name        String
+  kind        ChannelKind
+  cityId      String?     @map("city_id") @db.Uuid
+  projectId   String?     @map("project_id") @db.Uuid
+  /// Set on a DEPARTMENT channel; membership is derived from it.
+  departmentId String?    @map("department_id") @db.Uuid
+  description String?
+  /// Who made a GROUP (they can remove members). Null for older channels.
+  createdById String?     @map("created_by_id") @db.Uuid
+  createdAt   DateTime    @default(now()) @map("created_at")
+  deletedAt   DateTime?   @map("deleted_at")
+
+  workspace Workspace       @relation(fields: [workspaceId], references: [id])
+  city      City?           @relation(fields: [cityId], references: [id])
+  project   Project?        @relation(fields: [projectId], references: [id])
+  department Department?    @relation(fields: [departmentId], references: [id])
+  messages  Message[]
+  members   ChannelMember[]
+
+  @@map("channels")
+}
+
+model ChannelMember {
+  channelId String   @map("channel_id") @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  joinedAt  DateTime @default(now()) @map("joined_at")
+  lastReadAt DateTime? @map("last_read_at")
+
+  channel Channel @relation(fields: [channelId], references: [id])
+  user    User    @relation(fields: [userId], references: [id])
+
+  @@id([channelId, userId])
+  @@map("channel_members")
+}
+
+model Message {
+  id        String    @id @default(uuid()) @db.Uuid
+  channelId String    @map("channel_id") @db.Uuid
+  authorId  String?   @map("author_id") @db.Uuid // null for "Podium Bot" system messages
+  body      String
+  createdAt DateTime  @default(now()) @map("created_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  channel Channel @relation(fields: [channelId], references: [id])
+  author  User?   @relation(fields: [authorId], references: [id])
+
+  @@index([channelId, createdAt])
+  @@map("messages")
+}
+
+// =========================================================================
+// MAIL (Gmail integration — stub-capable, see docs/integration-setup.md)
+// =========================================================================
+
+/// A Google account a user has connected. Tokens are stored encrypted at rest
+/// (see GoogleTokenCipher); this table never holds a plaintext credential.
+/// Nothing is written here until a real OAuth callback succeeds — there is no
+/// code path that fabricates a connected account.
+model GoogleAccount {
+  id             String    @id @default(uuid()) @db.Uuid
+  workspaceId    String    @map("workspace_id") @db.Uuid
+  userId         String    @unique @map("user_id") @db.Uuid
+  googleEmail    String    @map("google_email")
+  /// AES-256-GCM ciphertext, never the raw token.
+  accessTokenEnc String    @map("access_token_enc")
+  refreshTokenEnc String?  @map("refresh_token_enc")
+  expiresAt      DateTime  @map("expires_at")
+  scopes         String
+  /// Gmail's history cursor. Incremental sync asks for changes since this id
+  /// rather than re-listing the mailbox; null means a full sync is still owed.
+  gmailHistoryId String?   @map("gmail_history_id")
+  lastSyncedAt   DateTime? @map("last_synced_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+  revokedAt      DateTime? @map("revoked_at")
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([workspaceId])
+  @@map("google_accounts")
+}
+
+model Email {
+  id               String    @id @default(uuid()) @db.Uuid
+  /// True for rows produced by GOOGLE_INTEGRATION_MODE=sandbox. Sandbox rows
+  /// are visibly marked everywhere they surface so a demo can never be
+  /// mistaken for a live mailbox.
+  isSandbox        Boolean   @default(false) @map("is_sandbox")
+  workspaceId      String    @map("workspace_id") @db.Uuid
+  gmailMessageId   String    @unique @map("gmail_message_id")
+  threadId         String    @map("thread_id")
+  fromAddress      String    @map("from_address")
+  subject          String
+  snippet          String?
+  receivedAt       DateTime  @map("received_at")
+  isUnread         Boolean   @default(true) @map("is_unread")
+  isStarred        Boolean   @default(false) @map("is_starred")
+  linkedClientId   String?   @map("linked_client_id") @db.Uuid
+  linkedProjectId  String?   @map("linked_project_id") @db.Uuid
+  linkedVendorId   String?   @map("linked_vendor_id") @db.Uuid
+  linkedLeadId     String?   @map("linked_lead_id") @db.Uuid
+  createdAt        DateTime  @default(now()) @map("created_at")
+
+  project Project? @relation(fields: [linkedProjectId], references: [id])
+
+  @@index([workspaceId, isUnread])
+  @@map("emails")
+}
+
+// =========================================================================
+// CALENDAR / MEET
+// =========================================================================
+
+model Meeting {
+  id        String    @id @default(uuid()) @db.Uuid
+  isSandbox Boolean   @default(false) @map("is_sandbox")
+  projectId String?   @map("project_id") @db.Uuid
+  title     String
+  startsAt  DateTime  @map("starts_at")
+  durationMinutes Int @default(30) @map("duration_minutes")
+  meetLink  String?   @map("meet_link")
+  notes     String?
+  createdAt DateTime  @default(now()) @map("created_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  project      Project?       @relation(fields: [projectId], references: [id])
+  actionItems  MeetingActionItem[]
+
+  @@map("meetings")
+}
+
+model MeetingActionItem {
+  id          String    @id @default(uuid()) @db.Uuid
+  meetingId   String    @map("meeting_id") @db.Uuid
+  text        String
+  ownerId     String    @map("owner_id") @db.Uuid
+  promotedTaskId String? @map("promoted_task_id") @db.Uuid
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  meeting Meeting @relation(fields: [meetingId], references: [id])
+
+  @@map("meeting_action_items")
+}
+
+// =========================================================================
+// EVENT DAY
+// =========================================================================
+
+model Runsheet {
+  id        String    @id @default(uuid()) @db.Uuid
+  projectId String    @map("project_id") @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  project Project        @relation(fields: [projectId], references: [id])
+  items   RunsheetItem[]
+
+  @@map("runsheets")
+}
+
+model RunsheetItem {
+  id            String    @id @default(uuid()) @db.Uuid
+  runsheetId    String    @map("runsheet_id") @db.Uuid
+  scheduledTime String    @map("scheduled_time") // HH:MM cue time, event-day-local
+  text          String
+  ownerId       String    @map("owner_id") @db.Uuid
+  doneAt        DateTime? @map("done_at")
+  sortOrder     Int       @default(0) @map("sort_order")
+
+  runsheet Runsheet @relation(fields: [runsheetId], references: [id])
+
+  @@map("runsheet_items")
+}
+
+model EventDayCheckin {
+  id          String   @id @default(uuid()) @db.Uuid
+  projectId   String   @map("project_id") @db.Uuid
+  userId      String   @map("user_id") @db.Uuid
+  checkedInAt DateTime @default(now()) @map("checked_in_at")
+
+  project Project @relation(fields: [projectId], references: [id])
+
+  @@unique([projectId, userId])
+  @@map("event_day_checkins")
+}
+
+model EventDayIncident {
+  id         String           @id @default(uuid()) @db.Uuid
+  projectId  String           @map("project_id") @db.Uuid
+  severity   IncidentSeverity
+  text       String
+  reportedById String         @map("reported_by") @db.Uuid
+  raisedRiskId String?        @map("raised_risk_id") @db.Uuid // set when severity High/Critical auto-raises a risk
+  createdAt  DateTime         @default(now()) @map("created_at")
+
+  project Project @relation(fields: [projectId], references: [id])
+
+  @@index([projectId])
+  @@map("event_day_incidents")
+}
+
+// =========================================================================
+// PEOPLE (operationally scoped — not a full HRMS, blueprint §22)
+// =========================================================================
+
+model Attendance {
+  userId    String           @id @map("user_id") @db.Uuid
+  status    AttendanceStatus @default(PRESENT)
+  updatedAt DateTime         @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@map("attendance")
+}
+
+model Leave {
+  id        String      @id @default(uuid()) @db.Uuid
+  userId    String      @map("user_id") @db.Uuid
+  fromDate  DateTime    @map("from_date")
+  toDate    DateTime    @map("to_date")
+  type      LeaveType
+  status    LeaveStatus @default(PENDING)
+  note      String?
+  decidedById String?   @map("decided_by") @db.Uuid
+  createdAt DateTime    @default(now()) @map("created_at")
+  updatedAt DateTime    @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId, status])
+  @@map("leaves")
+}
+
+model Freelancer {
+  id             String    @id @default(uuid()) @db.Uuid
+  workspaceId    String    @map("workspace_id") @db.Uuid
+  name           String
+  /// Nullable for the same reason as Client.cityId — see that comment.
+  cityId         String?   @map("city_id") @db.Uuid
+  phone          String?
+  phoneRaw       String?   @map("phone_raw")
+  /// Free-text role from the roster, e.g. "BARTENDER", "CHEF".
+  category       String?
+  source         String?
+  /// BUG-002 fix: idempotency key for re-running the real-data importer.
+  externalRef    String?   @map("external_ref")
+  /// IBG/BCII bartender certification expiry. Nullable because the real
+  /// staffing roster records none — and a fabricated expiry date would drive
+  /// real compliance decisions on event day. Unknown must stay unknown.
+  certExpiresAt  DateTime? @map("cert_expires_at")
+  /// Nullable: real day rates are negotiated per event, not in the roster.
+  dayRate        Decimal?  @map("day_rate") @db.Decimal(10, 2)
+  /// The same crew costs more away from home — AMM’s roster quotes two
+  /// figures, a local rate and an outstation one. dayRate above is the local
+  /// (in-city) rate; this is what they are paid for an event outside it.
+  dayRateOutstation Decimal? @map("day_rate_outstation") @db.Decimal(10, 2)
+  /// Whether the freelancer agreement has been signed. A boolean, not a date:
+  /// the roster records only that it happened, and inventing a date would put
+  /// a fabricated figure on a contract record.
+  agreementSigned Boolean  @default(false) @map("agreement_signed")
+  eventsCount    Int       @default(0) @map("events_count")
+  rating         Decimal?  @db.Decimal(2, 1)
+  isAvailable    Boolean   @default(true) @map("is_available")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+  deletedAt      DateTime? @map("deleted_at")
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id])
+  city      City?     @relation(fields: [cityId], references: [id])
+  crewRequests CrewRequest[]
+
+  @@unique([workspaceId, phone])
+  @@unique([workspaceId, externalRef])
+  @@map("freelancers")
+}
+
+// =========================================================================
+// KNOWLEDGE / SOPS
+// =========================================================================
+
+/// One 'are you free for this event?' asked of one bartender.
+///
+/// Freelancer.isAvailable is a single global flag — useful for 'who is
+/// around at all', useless for staffing a date, because a bartender free on
+/// the 12th is not free on the 14th. This table is the per-event answer, and
+/// it is also the audit trail: who was asked, when, what they said, and
+/// through which channel.
+model CrewRequest {
+  id           String    @id @default(uuid()) @db.Uuid
+  workspaceId  String    @map("workspace_id") @db.Uuid
+  projectId    String    @map("project_id") @db.Uuid
+  freelancerId String    @map("freelancer_id") @db.Uuid
+  status       CrewRequestStatus @default(SENT)
+  /// How it was asked — 'whatsapp', or 'manual' when somebody phoned them.
+  channel      String    @default("whatsapp")
+  /// The provider's own message id, so a delivery webhook can find this row.
+  providerRef  String?   @map("provider_ref")
+  /// What they actually replied, kept verbatim. A tapped button is tidy; a
+  /// typed 'yes but only till 11' is the answer that matters and must not be
+  /// flattened into a boolean.
+  replyText    String?   @map("reply_text")
+  sentAt       DateTime  @default(now()) @map("sent_at")
+  respondedAt  DateTime? @map("responded_at")
+  createdById  String?   @map("created_by") @db.Uuid
+
+  workspace  Workspace  @relation(fields: [workspaceId], references: [id])
+  project    Project    @relation(fields: [projectId], references: [id])
+  freelancer Freelancer @relation(fields: [freelancerId], references: [id])
+
+  /// One live ask per person per event: asking twice is how somebody gets two
+  /// messages and the second answer silently overwrites the first.
+  @@unique([projectId, freelancerId])
+  @@index([workspaceId, status])
+  @@map("crew_requests")
+}
+
+enum CrewRequestStatus {
+  SENT
+  AVAILABLE
+  UNAVAILABLE
+  /// Sending failed, or the number is not on WhatsApp.
+  FAILED
+}
+
+model Sop {
+  id          String    @id @default(uuid()) @db.Uuid
+  workspaceId String    @map("workspace_id") @db.Uuid
+  title       String
+  department  String
+  ownerId     String?   @map("owner_id") @db.Uuid
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  deletedAt   DateTime? @map("deleted_at")
+
+  workspace Workspace    @relation(fields: [workspaceId], references: [id])
+  versions  SopVersion[]
+
+  @@map("sops")
+}
+
+model SopVersion {
+  id          String   @id @default(uuid()) @db.Uuid
+  sopId       String   @map("sop_id") @db.Uuid
+  versionNo   Int      @map("version_no")
+  body        String
+  stepsCount  Int      @default(0) @map("steps_count")
+  createdAt   DateTime @default(now()) @map("created_at")
+  createdById String?  @map("created_by") @db.Uuid
+
+  sop Sop @relation(fields: [sopId], references: [id])
+
+  @@unique([sopId, versionNo])
+  @@map("sop_versions")
+}
+
+// =========================================================================
+// AUTOMATION ENGINE (blueprint §12)
+// =========================================================================
+
+model AutomationRule {
+  id             String   @id @default(uuid()) @db.Uuid
+  workspaceId    String   @map("workspace_id") @db.Uuid
+  name           String
+  triggerType    String   @map("trigger_type") // event | schedule | threshold | time_relative
+  triggerConfig  Json     @map("trigger_config")
+  actions        Json // [{type, config}, ...]
+  isEnabled      Boolean  @default(true) @map("is_enabled")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+  deletedAt      DateTime? @map("deleted_at")
+
+  workspace Workspace        @relation(fields: [workspaceId], references: [id])
+  runs      AutomationRun[]
+
+  @@map("automation_rules")
+}
+
+model AutomationRun {
+  id            String              @id @default(uuid()) @db.Uuid
+  ruleId        String              @map("rule_id") @db.Uuid
+  triggeredBy   String              @map("triggered_by") // entity id or "schedule"
+  triggerHash   String              @map("trigger_hash") // (ruleId, entityId, triggerHash) idempotency
+  status        AutomationRunStatus @default(PENDING)
+  attempt       Int                 @default(1)
+  error         String?
+  startedAt     DateTime            @default(now()) @map("started_at")
+  finishedAt    DateTime?           @map("finished_at")
+
+  rule AutomationRule @relation(fields: [ruleId], references: [id])
+
+  @@unique([ruleId, triggeredBy, triggerHash])
+  @@map("automation_runs")
+}
+
+// =========================================================================
+// NOTIFICATIONS / AUDIT
+// =========================================================================
+
+model Notification {
+  id         String    @id @default(uuid()) @db.Uuid
+  workspaceId String   @map("workspace_id") @db.Uuid
+  userId     String    @map("user_id") @db.Uuid
+  icon       String?
+  text       String
+  readAt     DateTime? @map("read_at")
+  sourceType String?   @map("source_type")
+  sourceId   String?   @map("source_id") @db.Uuid
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id])
+  user      User      @relation(fields: [userId], references: [id])
+
+  @@index([userId, readAt])
+  @@map("notifications")
+}
+
+/// Universal, append-only audit trail. Never updated, never deleted — written
+/// exclusively by the shared audit interceptor (blueprint §7/§30), not by
+/// individual endpoint handlers.
+model AuditLog {
+  id         String   @id @default(uuid()) @db.Uuid
+  workspaceId String  @map("workspace_id") @db.Uuid
+  actorId    String?  @map("actor_id") @db.Uuid
+  action     String // e.g. "invoice.issue", "flow_step.complete"
+  entityType String   @map("entity_type")
+  entityId   String   @map("entity_id") @db.Uuid
+  before     Json?
+  after      Json?
+  ip         String?
+  at         DateTime @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id])
+  actor     User?     @relation(fields: [actorId], references: [id])
+
+  @@index([entityType, entityId])
+  @@index([workspaceId, at])
+  @@map("audit_logs")
+}
+
+/// Backs idempotency-key support on financial/inventory mutation endpoints
+/// (blueprint §7/§32). Short-lived; a cleanup job may prune rows older than
+/// its retention window once introduced.
+model IdempotencyKey {
+  key         String   @id
+  endpoint    String
+  requestHash String   @map("request_hash")
+  responseBody Json?   @map("response_body")
+  statusCode  Int?     @map("status_code")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@map("idempotency_keys")
+}
+
+/// A P&L statement someone builds by hand (Reports → P&L → Add P&L): for a
+/// period, optionally one city or one project, with its own revenue, cost,
+/// expense, other-income and tax lines. Separate from the computed actuals on
+/// the P&L page — nothing here is added into those figures.
+model PnlStatement {
+  id          String    @id @default(uuid()) @db.Uuid
+  workspaceId String    @map("workspace_id") @db.Uuid
+  title       String
+  cityId      String?   @map("city_id") @db.Uuid
+  projectId   String?   @map("project_id") @db.Uuid
+  periodFrom  DateTime? @map("period_from") @db.Date
+  periodTo    DateTime? @map("period_to") @db.Date
+  notes       String?
+  createdById String    @map("created_by_id") @db.Uuid
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  deletedAt   DateTime? @map("deleted_at")
+
+  lines PnlLine[]
+
+  @@index([workspaceId, deletedAt])
+  @@map("pnl_statements")
+}
+
+/// One line of a P&L statement. `section` is REVENUE, DIRECT_COST, OPEX,
+/// OTHER_INCOME or TAX; amounts are positive and the section decides the sign.
+model PnlLine {
+  id          String  @id @default(uuid()) @db.Uuid
+  statementId String  @map("statement_id") @db.Uuid
+  section     String
+  label       String
+  amount      Decimal @db.Decimal(14, 2)
+  position    Int     @default(0)
+
+  statement PnlStatement @relation(fields: [statementId], references: [id])
+
+  @@index([statementId])
+  @@map("pnl_lines")
+}

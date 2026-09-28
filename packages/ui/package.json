@@ -1,0 +1,15 @@
+{
+  "name": "@podium/ui",
+  "version": "0.1.0",
+  "private": true,
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "typecheck": "echo \"(type-checked as part of @podium/web build)\"",
+    "lint": "echo \"(no lint configured for @podium/ui yet)\"",
+    "test": "echo \"(no tests in @podium/ui yet)\""
+  },
+  "peerDependencies": {
+    "react": "^18.3.1"
+  }
+}

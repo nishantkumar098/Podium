@@ -1,0 +1,13 @@
+{
+  "moduleFileExtensions": ["js", "json", "ts"],
+  "rootDir": ".",
+  "testEnvironment": "node",
+  "testRegex": ".e2e-spec.ts$",
+  "transform": { "^.+\\.(t|j)s$": "ts-jest" },
+  "setupFiles": ["<rootDir>/jest.setup.ts"],
+  "testTimeout": 20000,
+  "moduleNameMapper": {
+    "^@podium/db$": "<rootDir>/../../../packages/db/src/index.ts",
+    "^@podium/shared-types$": "<rootDir>/../../../packages/shared-types/src/index.ts"
+  }
+}

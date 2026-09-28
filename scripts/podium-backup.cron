@@ -1,0 +1,9 @@
+# Podium v2 — nightly database backup.
+# Install with:  crontab -l | cat - scripts/podium-backup.cron | crontab -
+#
+# Runs at 02:15 every night. Adjust PODIUM_BACKUP_DIR to a volume that is NOT
+# on the same disk as the database — a backup that dies with the host is not a
+# backup. Off-host copies (S3, a mounted NAS, borg/restic to a remote) are the
+# operator's call; the script writes a plain pg_restore-compatible file so any
+# of those can pick it up.
+15 2 * * * cd /opt/podium && PODIUM_BACKUP_DIR=/var/backups/podium PODIUM_BACKUP_RETENTION_DAYS=30 ./scripts/backup-db.sh >> /var/log/podium-backup.log 2>&1

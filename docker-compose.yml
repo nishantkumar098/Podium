@@ -1,0 +1,35 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: podium-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: podium
+      POSTGRES_PASSWORD: podium_dev_password
+      POSTGRES_DB: podium_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - podium_pg_data:/var/lib/postgresql/data
+      # Creates podium_shadow on first boot -- see SHADOW_DATABASE_URL in .env.example
+      - ./scripts/db-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U podium -d podium_dev"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: podium-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  podium_pg_data:

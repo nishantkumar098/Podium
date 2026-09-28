@@ -1,0 +1,13 @@
+-- Closes a real drift between the committed migrations and schema.prisma.
+--
+-- `budgets.updated_at` was created WITH a database default by an earlier
+-- hand-edited migration, but the Prisma model declares it `@updatedAt`
+-- (application-set, no DB default). Because the migrations did not
+-- reproduce the schema, `prisma migrate dev` -- the command the README told
+-- new engineers to run -- stopped and prompted "Enter a name for the new
+-- migration", which reads as a hang in a non-interactive shell and had to
+-- be answered before local setup could continue.
+--
+-- No behavioural change: Prisma has always written this column itself on
+-- every update, so the default was never the value that landed.
+ALTER TABLE "budgets" ALTER COLUMN "updated_at" DROP DEFAULT;
